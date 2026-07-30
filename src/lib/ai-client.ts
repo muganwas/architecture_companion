@@ -7,13 +7,13 @@ interface AIClientConfig {
 }
 
 function getConfig(): AIClientConfig {
-  const provider = (process.env.AI_PROVIDER || "openai") as AIProvider;
+  const provider = (process.env.AI_PROVIDER || "deepseek") as AIProvider;
 
   if (provider === "deepseek") {
     return {
       provider: "deepseek",
       apiKey: process.env.DEEPSEEK_API_KEY || "",
-      model: process.env.DEEPSEEK_MODEL || "deepseek-chat",
+      model: process.env.DEEPSEEK_MODEL || "deepseek-chat", // DeepSeek V4 Pro
     };
   }
 
