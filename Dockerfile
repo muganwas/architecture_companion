@@ -1,7 +1,14 @@
 # ---- Base Stage ----
 FROM node:22-alpine AS base
 WORKDIR /app
-ENV NODE_ENV=production
+
+# ---- Dev Stage (hot reload with volumes) ----
+FROM base AS dev
+RUN apk add --no-cache libc6-compat
+COPY package.json package-lock.json ./
+RUN npm ci
+COPY . .
+CMD ["npm", "run", "dev"]
 
 # ---- Dependencies Stage ----
 FROM base AS deps
@@ -17,6 +24,7 @@ RUN npm run build
 
 # ---- Production Stage ----
 FROM base AS runner
+ENV NODE_ENV=production
 
 RUN addgroup --system --gid 1001 nodejs && \
     adduser --system --uid 1001 nextjs

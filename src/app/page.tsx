@@ -6,7 +6,7 @@ export default function Home() {
       {/* Header */}
       <header className="text-center py-20 px-4 bg-gradient-to-b from-blue-50 to-white">
         <h1 className="text-5xl font-bold text-zinc-900 tracking-tight">
-          🏗️ AI Architecture Companion
+          🏗️ Architecture Companion
         </h1>
         <p className="mt-4 text-lg text-zinc-600 max-w-xl mx-auto">
           Describe your dream building or upload a sketch — our AI generates
@@ -67,7 +67,7 @@ export default function Home() {
         <p>
           Built with Next.js · Tailwind CSS · OpenAI / DeepSeek · Docker
         </p>
-        <p className="mt-1">© {new Date().getFullYear()} AI Architecture Companion</p>
+        <p className="mt-1">© {new Date().getFullYear()} Architecture Companion</p>
       </footer>
     </div>
   );

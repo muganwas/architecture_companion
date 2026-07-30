@@ -1,0 +1,13 @@
+node_modules
+.next
+.git
+.env
+.env.local
+.env.*.local
+*.md
+wireframe_outline.md
+wireframes.png
+.gitignore
+.dockerignore
+Dockerfile
+docker-compose.yml
