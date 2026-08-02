@@ -29,39 +29,39 @@ export default function ResultsPage() {
 
   if (!result) {
     return (
-      <div className="flex items-center justify-center min-h-[60vh]">
+      <div className="flex items-center justify-center min-h-[60vh] bg-[#f4f5f7]">
         <div className="animate-spin w-8 h-8 border-4 border-blue-600 border-t-transparent rounded-full" />
       </div>
     );
   }
 
   return (
-    <div className="flex flex-col flex-1">
+    <div className="flex flex-col flex-1 bg-[#f4f5f7]">
       {/* Top bar */}
-      <header className="px-6 py-4 border-b border-zinc-200 flex items-center gap-4 flex-wrap">
-        <Link href="/input" className="text-zinc-500 hover:text-zinc-800 transition-colors">
+      <header className="px-6 py-4 border-b border-zinc-200/60 flex items-center gap-4 flex-wrap bg-white">
+        <Link href="/input" className="text-zinc-500 hover:text-zinc-900 transition-colors text-sm font-medium">
           ← New Plan
         </Link>
-        <h1 className="text-lg font-semibold text-zinc-800">Your Floor Plan</h1>
+        <h1 className="text-lg font-semibold text-zinc-900">Your Floor Plan</h1>
 
         {/* View toggle */}
         <div className="ml-auto flex rounded-lg border border-zinc-200 overflow-hidden">
           <button
             onClick={() => setViewMode("2d")}
-            className={`px-4 py-1.5 text-sm ${
+            className={`px-4 py-1.5 text-sm font-medium transition-colors ${
               viewMode === "2d"
                 ? "bg-zinc-800 text-white"
-                : "text-zinc-600 hover:bg-zinc-50"
+                : "text-zinc-600 hover:bg-zinc-100"
             }`}
           >
             2D
           </button>
           <button
             onClick={() => setViewMode("3d")}
-            className={`px-4 py-1.5 text-sm ${
+            className={`px-4 py-1.5 text-sm font-medium transition-colors ${
               viewMode === "3d"
                 ? "bg-zinc-800 text-white"
-                : "text-zinc-600 hover:bg-zinc-50"
+                : "text-zinc-600 hover:bg-zinc-100"
             }`}
           >
             3D
@@ -81,8 +81,8 @@ export default function ResultsPage() {
 
           {/* Hover info */}
           {hoveredRoom && (
-            <div className="text-sm text-zinc-600 bg-zinc-50 rounded-lg px-4 py-2 border border-zinc-200">
-              <span className="font-semibold">{hoveredRoom.name}</span>:{" "}
+            <div className="text-sm text-zinc-700 bg-white rounded-lg px-4 py-2 border border-zinc-200/60">
+              <span className="font-semibold text-zinc-900">{hoveredRoom.name}</span>:{" "}
               {hoveredRoom.width}m × {hoveredRoom.height}m —{" "}
               {hoveredRoom.area.toFixed(1)}m²
             </div>

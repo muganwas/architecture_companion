@@ -47,13 +47,17 @@ export default function ProcessingPage() {
 
   if (error) {
     return (
-      <div className="flex flex-col items-center justify-center min-h-[60vh] gap-4 px-4">
-        <div className="text-5xl">😞</div>
-        <h2 className="text-xl font-semibold text-zinc-800">Something went wrong</h2>
-        <p className="text-zinc-500 text-center max-w-md">{error}</p>
+      <div className="flex flex-col items-center justify-center min-h-[60vh] gap-4 px-4 bg-[#f4f5f7]">
+        <svg className="w-12 h-12 text-zinc-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+          <circle cx="12" cy="12" r="10" />
+          <line x1="12" y1="8" x2="12" y2="12" />
+          <line x1="12" y1="16" x2="12.01" y2="16" />
+        </svg>
+        <h2 className="text-xl font-semibold text-zinc-900">Something went wrong</h2>
+        <p className="text-zinc-600 text-center max-w-md">{error}</p>
         <button
           onClick={() => router.push("/input")}
-          className="rounded-lg bg-blue-600 px-6 py-2 text-white hover:bg-blue-700 transition-colors"
+          className="rounded-lg bg-blue-600 px-6 py-2 text-white font-medium hover:bg-blue-700 transition-colors"
         >
           ← Try Again
         </button>
