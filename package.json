@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "docker:dev":"docker compose -f docker-compose.dev.yml up",
+    "docker:dev": "docker compose -f docker-compose.dev.yml up",
     "docker:up": "docker compose up",
     "dev": "next dev",
     "build": "next build",
@@ -11,6 +11,8 @@
     "lint": "eslint"
   },
   "dependencies": {
+    "@supabase/ssr": "^0.12.4",
+    "@supabase/supabase-js": "^2.109.0",
     "next": "16.2.12",
     "react": "19.2.4",
     "react-dom": "19.2.4"
