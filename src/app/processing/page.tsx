@@ -45,6 +45,13 @@ export default function ProcessingPage() {
     fetchPlan();
   }, [fetchPlan]);
 
+  // Navigate in an effect, not during render
+  useEffect(() => {
+    if (result) {
+      router.push("/results");
+    }
+  }, [result, router]);
+
   if (error) {
     return (
       <div className="flex flex-col items-center justify-center min-h-[60vh] gap-4 px-4 bg-[#f4f5f7]">
@@ -65,11 +72,11 @@ export default function ProcessingPage() {
     );
   }
 
-  if (result) {
-    // Navigate to results
-    router.push("/results");
-    return null;
+  // Show processing animation while fetching
+  if (!result && !error) {
+    return <ProcessingScreen onComplete={() => {}} />;
   }
 
-  return <ProcessingScreen onComplete={() => {}} />;
+  // Loading / transitioning
+  return null;
 }
