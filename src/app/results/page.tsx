@@ -13,6 +13,7 @@ export default function ResultsPage() {
   const [viewMode, setViewMode] = useState<"2d" | "3d">("2d");
   const [style, setStyle] = useState("modern");
   const [hoveredRoom, setHoveredRoom] = useState<GeneratedRoom | null>(null);
+  const [hoveredFurniture, setHoveredFurniture] = useState<{ name: string; room: string } | null>(null);
 
   useEffect(() => {
     const raw = sessionStorage.getItem("archResult");
@@ -44,8 +45,15 @@ export default function ResultsPage() {
         </Link>
         <h1 className="text-lg font-semibold text-zinc-900">Your Floor Plan</h1>
 
-        {/* View toggle */}
-        <div className="ml-auto flex rounded-lg border border-zinc-200 overflow-hidden">
+        {/* View toggle + Refine */}
+        <div className="ml-auto flex items-center gap-3">
+          <Link
+            href="/review"
+            className="px-3 py-1.5 text-sm font-medium text-blue-600 hover:bg-blue-50 rounded-lg transition-colors"
+          >
+            Refine Prompt
+          </Link>
+          <div className="flex rounded-lg border border-zinc-200 overflow-hidden">
           <button
             onClick={() => setViewMode("2d")}
             className={`px-4 py-1.5 text-sm font-medium transition-colors ${
@@ -66,6 +74,7 @@ export default function ResultsPage() {
           >
             3D
           </button>
+          </div>
         </div>
       </header>
 
@@ -73,10 +82,35 @@ export default function ResultsPage() {
       <main className="flex-1 flex flex-col lg:flex-row gap-6 p-6">
         {/* Canvas */}
         <div className="flex-1 flex flex-col items-center gap-4">
+          {/* Validation warnings — advisory only */}
+          {result.warnings && result.warnings.length > 0 && (
+            <div className="w-full max-w-[640px] bg-amber-50 border border-amber-200 rounded-xl p-4">
+              <div className="flex items-start gap-2.5">
+                <svg className="w-5 h-5 text-amber-500 mt-0.5 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <circle cx="12" cy="12" r="10" />
+                  <line x1="12" y1="8" x2="12" y2="12" />
+                  <line x1="12" y1="16" x2="12.01" y2="16" />
+                </svg>
+                <div>
+                  <p className="text-sm font-semibold text-amber-800 mb-1.5">Advisory Notes</p>
+                  <ul className="space-y-1">
+                    {result.warnings.map((w, i) => (
+                      <li key={i} className="text-xs text-amber-700">{w}</li>
+                    ))}
+                  </ul>
+                </div>
+              </div>
+            </div>
+          )}
+
           <FloorPlanCanvas
             rooms={result.rooms}
+            doors={result.doors || []}
+            windows={result.windows || []}
+            placedFurniture={result.placedFurniture}
             viewMode={viewMode}
             onRoomHover={setHoveredRoom}
+            onFurnitureHover={setHoveredFurniture}
           />
 
           {/* Hover info */}
@@ -85,6 +119,12 @@ export default function ResultsPage() {
               <span className="font-semibold text-zinc-900">{hoveredRoom.name}</span>:{" "}
               {hoveredRoom.width}m × {hoveredRoom.height}m —{" "}
               {hoveredRoom.area.toFixed(1)}m²
+            </div>
+          )}
+          {hoveredFurniture && (
+            <div className="text-sm text-zinc-700 bg-white rounded-lg px-4 py-2 border border-blue-300 shadow-sm">
+              🪑 <span className="font-semibold text-zinc-900">{hoveredFurniture.name}</span>
+              <span className="text-zinc-500 ml-2">in {hoveredFurniture.room}</span>
             </div>
           )}
         </div>

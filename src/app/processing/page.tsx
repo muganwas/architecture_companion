@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useRef } from "react";
 import { useRouter } from "next/navigation";
 import ProcessingScreen from "@/components/ProcessingScreen";
 import type { FloorPlanResult } from "@/lib/ai-client";
@@ -9,41 +9,50 @@ export default function ProcessingPage() {
   const router = useRouter();
   const [result, setResult] = useState<FloorPlanResult | null>(null);
   const [error, setError] = useState("");
-
-  const fetchPlan = useCallback(async () => {
-    try {
-      const raw = sessionStorage.getItem("archInput");
-      if (!raw) {
-        router.push("/input");
-        return;
-      }
-
-      const input = JSON.parse(raw);
-
-      const res = await fetch("/api/generate", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          description: input.description || "A 2-bedroom modern apartment",
-        }),
-      });
-
-      if (!res.ok) {
-        const err = await res.json();
-        throw new Error(err.error || "Failed to generate floor plan");
-      }
-
-      const data: FloorPlanResult = await res.json();
-      setResult(data);
-      sessionStorage.setItem("archResult", JSON.stringify(data));
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Something went wrong");
-    }
-  }, [router]);
+  const fetching = useRef(false);
 
   useEffect(() => {
-    fetchPlan();
-  }, [fetchPlan]);
+    if (fetching.current) return;
+    fetching.current = true;
+
+    const raw = sessionStorage.getItem("archInput");
+    if (!raw) {
+      router.push("/input");
+      return;
+    }
+
+    const input = JSON.parse(raw);
+
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    fetch("/api/generate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        description: input.description || "A 2-bedroom modern apartment",
+      }),
+    })
+      .then(async (res) => {
+        if (!res.ok) {
+          const err = await res.json();
+          throw new Error(err.error || "Failed to generate floor plan");
+        }
+        return res.json();
+      })
+      .then((data: FloorPlanResult) => {
+        setResult(data);
+        sessionStorage.setItem("archResult", JSON.stringify(data));
+      })
+      .catch((e) => {
+        setError(e instanceof Error ? e.message : "Something went wrong");
+      });
+  }, [router]);
+
+  // Navigate in an effect, not during render
+  useEffect(() => {
+    if (result) {
+      router.push("/results");
+    }
+  }, [result, router]);
 
   // Navigate in an effect, not during render
   useEffect(() => {

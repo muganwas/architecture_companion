@@ -45,7 +45,8 @@ function InputForm() {
         })
       );
 
-      router.push("/processing");
+      // Always go through review first
+      router.push("/review");
     },
     [mode, description, file, router]
   );
