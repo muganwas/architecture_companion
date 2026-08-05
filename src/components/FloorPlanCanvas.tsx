@@ -14,6 +14,7 @@ interface FloorPlanCanvasProps {
   doors: Door[];
   windows: Window[];
   placedFurniture?: PlacedFurniture[];
+  buildingPolygon?: Array<{ x: number; y: number }>;
   viewMode: "2d" | "3d";
   onRoomHover?: (room: GeneratedRoom | null) => void;
   onFurnitureHover?: (info: { name: string; room: string } | null) => void;
@@ -43,18 +44,25 @@ function fill(n: string) {
 
 interface BBox { x: number; y: number; w: number; h: number; }
 
-function computeBBox(rooms: GeneratedRoom[]): BBox {
+function computeBBox(rooms: GeneratedRoom[], poly?: Array<{ x: number; y: number }>): BBox {
   let x1 = Infinity, y1 = Infinity, x2 = -Infinity, y2 = -Infinity;
   for (const r of rooms) {
     if (r.x < x1) x1 = r.x; if (r.y < y1) y1 = r.y;
     if (r.x + r.width > x2) x2 = r.x + r.width;
     if (r.y + r.height > y2) y2 = r.y + r.height;
   }
+  // Include building polygon extent
+  if (poly) {
+    for (const p of poly) {
+      if (p.x < x1) x1 = p.x; if (p.y < y1) y1 = p.y;
+      if (p.x > x2) x2 = p.x; if (p.y > y2) y2 = p.y;
+    }
+  }
   return { x: x1, y: y1, w: x2 - x1 || 10, h: y2 - y1 || 10 };
 }
 
-function computeScale(rooms: GeneratedRoom[]): { s: number; bb: BBox } {
-  const bb = computeBBox(rooms);
+function computeScale(rooms: GeneratedRoom[], poly?: Array<{ x: number; y: number }>): { s: number; bb: BBox } {
+  const bb = computeBBox(rooms, poly);
   const drawW = STAGE_W - PAD * 2;
   const drawH = STAGE_H - PAD * 2;
   const s = Math.min(drawW / bb.w, drawH / bb.h);
@@ -125,12 +133,12 @@ function rectToScreenFlat(room: GeneratedRoom, s: number, bb: BBox): number[] {
 /* ------------------------------------------------------------------ */
 
 export default function FloorPlanCanvas({
-  rooms, doors, windows, placedFurniture, viewMode, onRoomHover, onFurnitureHover,
+  rooms, doors, windows, placedFurniture, buildingPolygon, viewMode, onRoomHover, onFurnitureHover,
 }: FloorPlanCanvasProps) {
   const [hoveredKey, setHoveredKey] = useState<string | null>(null);
   const [hoveredFurnIdx, setHoveredFurnIdx] = useState<number | null>(null);
 
-  const { s, bb } = useMemo(() => computeScale(rooms), [rooms]);
+  const { s, bb } = useMemo(() => computeScale(rooms, buildingPolygon), [rooms, buildingPolygon]);
   const roomMap = useMemo(() => new Map(rooms.map(r => [r.name, r])), [rooms]);
 
   // Group rooms by name for compound shapes
@@ -705,13 +713,7 @@ export default function FloorPlanCanvas({
                   );
                 })}
 
-                {/* Room label */}
-                <Text x={cPx.x - 55} y={cPx.y - 16} width={110} height={16}
-                  text={name} fontSize={11} fontStyle="bold" fill="#2d2d3f"
-                  align="center" verticalAlign="middle" fontFamily="system-ui, sans-serif" />
-                <Text x={cPx.x - 55} y={cPx.y + 2} width={110} height={14}
-                  text={`${totalArea.toFixed(1)} m²`} fontSize={9} fill="#888"
-                  align="center" verticalAlign="middle" fontFamily="system-ui, sans-serif" />
+                {/* Room label — moved to Layer 4 */}
               </Group>
             );
           })}
@@ -726,6 +728,22 @@ export default function FloorPlanCanvas({
 
         {/* ======== LAYER 3: Annotations ======== */}
         <Layer listening={false}>
+          {/* Building perimeter outline */}
+          {buildingPolygon && buildingPolygon.length >= 3 && (() => {
+            const pts = buildingPolygon.flatMap(p => {
+              const sp = toCanvas(p.x, p.y, s, bb);
+              return [sp.x, sp.y];
+            });
+            pts.push(pts[0], pts[1]);
+            return (
+              <Line
+                points={pts}
+                stroke="#c8c0b4" strokeWidth={2} dash={[8, 4]}
+                fill="rgba(0,0,0,0)" lineJoin="round" tension={0} opacity={0.6}
+              />
+            );
+          })()}
+
           {/* North arrow */}
           <Group x={STAGE_W - 38} y={28}>
             <Line points={[0, -8, -7, 6, 7, 6]} closed fill="#3a3a4a" />
@@ -739,6 +757,28 @@ export default function FloorPlanCanvas({
             <Line points={[5 * s, -6, 5 * s, 6]} stroke="#3a3a4a" strokeWidth={1} />
             <Text x={2.5 * s - 10} y={10} text="5m" fontSize={10} fill="#999" width={20} align="center" />
           </Group>
+        </Layer>
+
+        {/* ======== LAYER 4: Text on top of everything ======== */}
+        <Layer listening={false}>
+          {grouped.map(([key, parts]) => {
+            const center = roomCenter(parts[0]);
+            const cPx = toCanvas(center.x, center.y, s, bb);
+            const name = parts[0].name;
+            const totalArea = parts.reduce((sum, p) => sum + p.area, 0);
+            return (
+              <Group key={`label-${key}`}>
+                <Text x={cPx.x - 55} y={cPx.y - 20} width={110} height={18}
+                  text={name} fontSize={11} fontStyle="bold" fill="#2d2d3f"
+                  align="center" verticalAlign="middle" fontFamily="system-ui, sans-serif"
+                  shadowColor="#ffffff" shadowBlur={3} shadowOpacity={0.8} />
+                <Text x={cPx.x - 55} y={cPx.y} width={110} height={14}
+                  text={`${totalArea.toFixed(1)} m²`} fontSize={9} fill="#666"
+                  align="center" verticalAlign="middle" fontFamily="system-ui, sans-serif"
+                  shadowColor="#ffffff" shadowBlur={2} shadowOpacity={0.7} />
+              </Group>
+            );
+          })}
         </Layer>
       </Stage>
 

@@ -29,6 +29,7 @@ export default function ProcessingPage() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         description: input.description || "A 2-bedroom modern apartment",
+        areaM2: input.areaM2 || undefined,
       }),
     })
       .then(async (res) => {

@@ -108,6 +108,7 @@ export default function ResultsPage() {
             doors={result.doors || []}
             windows={result.windows || []}
             placedFurniture={result.placedFurniture}
+            buildingPolygon={result.buildingPolygon}
             viewMode={viewMode}
             onRoomHover={setHoveredRoom}
             onFurnitureHover={setHoveredFurniture}

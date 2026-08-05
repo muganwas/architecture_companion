@@ -52,6 +52,7 @@ export default function ReviewPage() {
         mode: "text",
         description: editedPrompt.trim(),
         fileName: null,
+        areaM2: analysis?.areaM2,
       })
     );
     router.push("/processing");
@@ -147,6 +148,24 @@ export default function ReviewPage() {
                     ))}
                   </ul>
                 </div>
+              </div>
+            </div>
+          )}
+
+          {/* Area conversion notice */}
+          {analysis.areaM2 && analysis.areaOriginal && (
+            <div className="bg-blue-50 rounded-xl border border-blue-200 p-4">
+              <div className="flex items-center gap-2 text-blue-800">
+                <span className="text-lg">📐</span>
+                <span>
+                  <strong>Area converted:</strong> {analysis.areaOriginal} →{" "}
+                  <strong>{analysis.areaM2} m²</strong>
+                  {analysis.areaOriginal.toLowerCase().includes("ft") && (
+                    <span className="text-blue-600 text-sm ml-1">
+                      (÷ 10.764)
+                    </span>
+                  )}
+                </span>
               </div>
             </div>
           )}

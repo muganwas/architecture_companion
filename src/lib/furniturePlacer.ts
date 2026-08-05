@@ -6,6 +6,143 @@
 import { GeneratedRoom } from "./ai-client";
 import { PlacedFurniture } from "./furniture";
 import { getFurnitureForRoom, getFurnitureById } from "./furniture";
+import { isFurnitureInBounds } from "./layoutEngine";
+
+/**
+ * Smart placement: tries original position, polygon centroid, scaled down, rotated.
+ * Returns the PlacedFurniture if any attempt fits, null otherwise.
+ */
+function smartPlace(
+  itemId: string,
+  room: GeneratedRoom,
+  prefX: number, prefY: number,
+  rotation: number,
+  scale: number,
+  existingItems: PlacedFurniture[]
+): PlacedFurniture | null {
+  const item = getFurnitureById(itemId);
+  if (!item) return null;
+
+  // Compute polygon centroid if room has a polygon
+  const centroid = getRoomCentroid(room);
+
+  const positions = [
+    { x: prefX, y: prefY, scale },
+    { x: centroid.x, y: centroid.y, scale },
+    { x: centroid.x, y: centroid.y, scale: scale * 0.8 },
+    { x: centroid.x, y: centroid.y, scale: scale * 0.65 },
+    { x: centroid.x, y: centroid.y, scale: scale * 0.5 },
+    { x: centroid.x, y: centroid.y, scale: scale * 0.4 },
+  ];
+
+  for (const pos of positions) {
+    for (const rot of [rotation, (rotation + 90) % 360]) {
+      const iw = (rot === rotation ? item.width : item.height) * pos.scale;
+      const ih = (rot === rotation ? item.height : item.width) * pos.scale;
+
+      // Check bounds
+      if (!isFurnitureInBounds(pos.x, pos.y, iw, ih, room)) continue;
+
+      // Check collisions with existing items in same room (skip same-group items)
+      if (collidesWithExisting(pos.x, pos.y, iw, ih, room.name, existingItems, itemId)) continue;
+
+      return { itemId, room: room.name, x: pos.x, y: pos.y, rotation: rot as 0 | 90 | 180 | 270, scale: pos.scale };
+    }
+  }
+
+  return null;
+}
+
+/** Get a point guaranteed to be inside the room's polygon (or rectangle center) */
+function getRoomCentroid(room: GeneratedRoom): { x: number; y: number } {
+  if (room.polygon && room.polygon.length >= 3) {
+    // Try bounding box center first (works for most clipped polygons)
+    const bcx = room.x + room.width / 2;
+    const bcy = room.y + room.height / 2;
+    if (pointInPolygon(bcx, bcy, room.polygon)) {
+      return { x: bcx, y: bcy };
+    }
+    // Grid search within bounding box for an interior point
+    for (let gx = 0.1; gx < 1; gx += 0.15) {
+      for (let gy = 0.1; gy < 1; gy += 0.15) {
+        const tx = room.x + room.width * gx;
+        const ty = room.y + room.height * gy;
+        if (pointInPolygon(tx, ty, room.polygon)) {
+          return { x: tx, y: ty };
+        }
+      }
+    }
+    // Fallback: vertex average
+    const cx = room.polygon.reduce((s, p) => s + p.x, 0) / room.polygon.length;
+    const cy = room.polygon.reduce((s, p) => s + p.y, 0) / room.polygon.length;
+    return { x: cx, y: cy };
+  }
+  return { x: room.x + room.width / 2, y: room.y + room.height / 2 };
+}
+
+/** Simple point-in-polygon test (local copy to avoid circular imports) */
+function pointInPolygon(px: number, py: number, poly: Array<{ x: number; y: number }>): boolean {
+  let inside = false;
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    const xi = poly[i].x, yi = poly[i].y;
+    const xj = poly[j].x, yj = poly[j].y;
+    if ((yi > py) !== (yj > py) && px < ((xj - xi) * (py - yi)) / (yj - yi) + xi) {
+      inside = !inside;
+    }
+  }
+  return inside;
+}
+
+/** Check if a new furniture item overlaps with any existing items in the same room */
+function collidesWithExisting(
+  x: number, y: number, w: number, h: number,
+  roomName: string,
+  existing: PlacedFurniture[],
+  myItemId: string
+): boolean {
+  const margin = 0.05; // 5cm gap — tight but prevents true overlap
+  const halfW = w / 2 + margin;
+  const halfH = h / 2 + margin;
+
+  for (const pf of existing) {
+    if (pf.room !== roomName) continue;
+    // Don't collision-check against items in the same functional group
+    // (kitchen items can be adjacent, bathroom items can be adjacent)
+    if (sameGroup(myItemId, pf.itemId)) continue;
+
+    const item = getFurnitureById(pf.itemId);
+    if (!item) continue;
+
+    const ew = item.width * pf.scale;
+    const eh = item.height * pf.scale;
+    const eHalfW = ew / 2 + margin;
+    const eHalfH = eh / 2 + margin;
+
+    if (
+      Math.abs(pf.x - x) < halfW + eHalfW &&
+      Math.abs(pf.y - y) < halfH + eHalfH
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** Items in the same functional group can be placed adjacent (no collision check between them) */
+function sameGroup(id1: string, id2: string): boolean {
+  const kitchenItems = ["kitchen-counter", "stove", "refrigerator", "kitchen-sink", "kitchen-island"];
+  const bathItems = ["toilet", "sink-bathroom", "bathtub", "shower"];
+  const livingItems = ["sofa", "coffee-table", "tv-unit", "armchair", "side-table", "rug-large"];
+  const bedItems = ["bed-", "side-table", "wardrobe", "rug-large"];
+
+  const groups = [kitchenItems, bathItems, livingItems, bedItems];
+  for (const group of groups) {
+    const m1 = group.some(prefix => id1.includes(prefix));
+    const m2 = group.some(prefix => id2.includes(prefix));
+    if (m1 && m2) return true; // same group, allow adjacency
+  }
+  return false;
+}
 
 /**
  * Place furniture into rooms based on room type and dimensions.
@@ -134,13 +271,13 @@ export function suggestFurniture(rooms: GeneratedRoom[]): PlacedFurniture[] {
       }
     }
 
-    /* ---- DINING ROOM — guaranteed table ---- */
+    /* ---- DINING ROOM — guaranteed table + chairs that fit ---- */
     if (/dining/i.test(name)) {
-      // Always place a dining table, scale down if room is small
-      const tableId = roomArea >= 18 ? "dining-table-6" : "dining-table-4";
+      // Scale table based on room size
+      const tableId = roomArea >= 20 ? "dining-table-6" : "dining-table-4";
+      const tableScale = roomArea < 8 ? 0.65 : roomArea < 12 ? 0.8 : 1.0;
       const table = getFurnitureById(tableId);
       if (table) {
-        const tableScale = roomArea < 10 ? 0.75 : 1.0;
         placed.push({
           itemId: tableId,
           room: room.name,
@@ -150,22 +287,32 @@ export function suggestFurniture(rooms: GeneratedRoom[]): PlacedFurniture[] {
           scale: tableScale,
         });
 
-        // Chairs around the table
-        const chairCount = tableId === "dining-table-6" ? 6 : 4;
+        // Chairs around the table — only place those that fit in the room
+        const maxChairs = tableId === "dining-table-6" ? 6 : 4;
+        // Small rooms get fewer chairs
+        const targetChairs = roomArea < 8 ? 2 : roomArea < 14 ? 4 : maxChairs;
         const tw = table.width * tableScale;
         const th = table.height * tableScale;
+        let chairsPlaced = 0;
 
-        for (let i = 0; i < chairCount; i++) {
-          const angle = (i / chairCount) * Math.PI * 2 - Math.PI / 2;
+        for (let i = 0; i < maxChairs && chairsPlaced < targetChairs; i++) {
+          const angle = (i / maxChairs) * Math.PI * 2 - Math.PI / 2;
           const dist = Math.max(tw, th) * 0.55;
-          placed.push({
-            itemId: "dining-chair",
-            room: room.name,
-            x: cx + Math.cos(angle) * dist,
-            y: cy + Math.sin(angle) * dist,
-            rotation: 0,
-            scale: tableScale,
-          });
+          const cx2 = cx + Math.cos(angle) * dist;
+          const cy2 = cy + Math.sin(angle) * dist;
+
+          // Only place chair if it fits in room bounds
+          if (pointInRoomBounds(cx2, cy2, room)) {
+            placed.push({
+              itemId: "dining-chair",
+              room: room.name,
+              x: cx2,
+              y: cy2,
+              rotation: 0,
+              scale: tableScale,
+            });
+            chairsPlaced++;
+          }
         }
       }
     }
@@ -272,18 +419,20 @@ export function suggestFurniture(rooms: GeneratedRoom[]): PlacedFurniture[] {
       }
     }
 
-    /* ---- KITCHEN ---- */
+    /* ---- KITCHEN — guaranteed counter + stove ---- */
     if (/kitchen/i.test(name)) {
-      // Counters along walls
+      const counterId = roomArea < 8 ? "kitchen-counter-small" : "kitchen-counter-straight";
+      // Counter along top wall
       placed.push({
-        itemId: "kitchen-counter-straight",
+        itemId: counterId,
         room: room.name,
         x: room.x + rw / 2,
         y: room.y + 0.35,
         rotation: 0,
-        scale: 1.0,
+        scale: roomArea < 8 ? 0.85 : 1.0,
       });
 
+      // Second counter for larger kitchens
       if (rw >= 3.5 && rh >= 3) {
         placed.push({
           itemId: "kitchen-counter-straight",
@@ -295,14 +444,14 @@ export function suggestFurniture(rooms: GeneratedRoom[]): PlacedFurniture[] {
         });
       }
 
-      // Stove
+      // Stove — ALWAYS placed
       placed.push({
         itemId: "stove-4-burner",
         room: room.name,
         x: room.x + rw * 0.75,
         y: room.y + 0.45,
         rotation: 0,
-        scale: 1.0,
+        scale: roomArea < 6 ? 0.8 : 1.0,
       });
 
       // Refrigerator
@@ -341,27 +490,31 @@ export function suggestFurniture(rooms: GeneratedRoom[]): PlacedFurniture[] {
 
       // Dining nook if kitchen is large enough and no separate dining
       if (roomArea >= 16 && rw >= 3 && rh >= 3.5) {
+        const nookX = room.x + rw * 0.25;
+        const nookY = room.y + rh * 0.75;
         placed.push({
           itemId: "dining-table-4",
           room: room.name,
-          x: room.x + rw * 0.25,
-          y: room.y + rh * 0.75,
+          x: nookX,
+          y: nookY,
           rotation: 0,
-          scale: 1.0,
+          scale: 0.85,
         });
-        // 4 chairs
-        const tableX = room.x + rw * 0.25;
-        const tableY = room.y + rh * 0.75;
+        // Chairs — only those that fit
         for (let i = 0; i < 4; i++) {
           const angle = (i / 4) * Math.PI * 2 - Math.PI / 2;
-          placed.push({
-            itemId: "dining-chair",
-            room: room.name,
-            x: tableX + Math.cos(angle) * 0.55,
-            y: tableY + Math.sin(angle) * 0.55,
-            rotation: 0,
-            scale: 1.0,
-          });
+          const cx2 = nookX + Math.cos(angle) * 0.5;
+          const cy2 = nookY + Math.sin(angle) * 0.5;
+          if (pointInRoomBounds(cx2, cy2, room)) {
+            placed.push({
+              itemId: "dining-chair",
+              room: room.name,
+              x: cx2,
+              y: cy2,
+              rotation: 0,
+              scale: 0.85,
+            });
+          }
         }
       }
     }
@@ -528,5 +681,119 @@ export function suggestFurniture(rooms: GeneratedRoom[]): PlacedFurniture[] {
     }
   }
 
-  return placed;
+  // ── Post-validation: keep essentials, try to fix out-of-bounds items ──
+  const roomMap = new Map(rooms.map(r => [r.name, r]));
+  const essentialIds = new Set([
+    "bed-single", "bed-double", "bed-queen", "bed-king",
+    "dining-table-4", "dining-table-6",
+    "toilet", "sink-bathroom", "shower",
+    "stove-4-burner", "refrigerator", "kitchen-sink",
+    "kitchen-counter-straight", "kitchen-counter-small", "kitchen-counter-corner", "kitchen-island",
+    "wardrobe", "desk",
+  ]);
+  // Note: "bathtub" NOT in essentialIds — it gets full bounds check;
+  // if it doesn't fit even after smartPlace, shower is substituted below
+
+  // Items that MUST appear — if smartPlace fails, compute fitting scale
+  const forceItems = new Set([
+    "kitchen-counter-straight", "kitchen-counter-small", "stove-4-burner",
+    "toilet", "kitchen-sink",
+  ]);
+
+  const validated: PlacedFurniture[] = [];
+
+  for (const pf of placed) {
+    const room = roomMap.get(pf.room);
+    if (!room) continue;
+    const item = getFurnitureById(pf.itemId);
+    if (!item) continue;
+
+    // Check current placement
+    const iw = item.width * pf.scale;
+    const ih = item.height * pf.scale;
+    const fits = isFurnitureInBounds(pf.x, pf.y, iw, ih, room);
+
+    if (fits) {
+      validated.push(pf);
+      continue;
+    }
+
+    // Doesn't fit — try smartPlace for essentials (tries smaller scales too)
+    if (essentialIds.has(pf.itemId)) {
+      const fixed = smartPlace(pf.itemId, room, pf.x, pf.y, pf.rotation, pf.scale, validated);
+      if (fixed) {
+        validated.push(fixed);
+      } else if (forceItems.has(pf.itemId)) {
+        // MUST appear: compute the max scale that fits at room center
+        const guaranteed = guaranteedPlace(pf.itemId, room, validated);
+        if (guaranteed) validated.push(guaranteed);
+      }
+    } else if (pf.itemId === "bathtub") {
+      // Bathtub doesn't fit — try a shower instead
+      const showerFix = smartPlace("shower", room, pf.x, pf.y, pf.rotation, 0.9, validated);
+      if (showerFix) {
+        validated.push(showerFix);
+      }
+    }
+    // Non-essential items that don't fit: just skip them
+  }
+
+  return validated;
+}
+
+/**
+ * Guaranteed placement: finds the maximum scale that fits at room center.
+ * Only for truly critical items (toilet, kitchen counter, stove).
+ */
+function guaranteedPlace(
+  itemId: string,
+  room: GeneratedRoom,
+  existing: PlacedFurniture[]
+): PlacedFurniture | null {
+  const item = getFurnitureById(itemId);
+  if (!item) return null;
+
+  const centroid = getRoomCentroid(room);
+
+  // Try scales from 100% down to 25% in steps
+  for (const scale of [1.0, 0.85, 0.7, 0.55, 0.4, 0.3, 0.25]) {
+    for (const rot of [0, 90]) {
+      const iw = (rot === 0 ? item.width : item.height) * scale;
+      const ih = (rot === 0 ? item.height : item.width) * scale;
+
+      if (isFurnitureInBounds(centroid.x, centroid.y, iw, ih, room) &&
+          !collidesWithExisting(centroid.x, centroid.y, iw, ih, room.name, existing, itemId)) {
+        return { itemId, room: room.name, x: centroid.x, y: centroid.y, rotation: rot as 0 | 90 | 180 | 270, scale };
+      }
+    }
+  }
+
+  // Absolute last resort: 20% scale
+  const minScale = 0.2;
+  return {
+    itemId,
+    room: room.name,
+    x: centroid.x,
+    y: centroid.y,
+    rotation: 0,
+    scale: minScale,
+  };
+}
+
+/** Quick check: is a point inside a room's area (polygon or rectangle)? */
+function pointInRoomBounds(px: number, py: number, room: GeneratedRoom): boolean {
+  if (room.polygon && room.polygon.length >= 3) {
+    let inside = false;
+    const poly = room.polygon;
+    for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+      const xi = poly[i].x, yi = poly[i].y;
+      const xj = poly[j].x, yj = poly[j].y;
+      if ((yi > py) !== (yj > py) && px < ((xj - xi) * (py - yi)) / (yj - yi) + xi) {
+        inside = !inside;
+      }
+    }
+    return inside;
+  }
+  return px >= room.x && px <= room.x + room.width &&
+         py >= room.y && py <= room.y + room.height;
 }

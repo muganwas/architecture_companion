@@ -32,6 +32,8 @@ interface GenerateFloorPlanInput {
   description: string;
   style?: "modern" | "rustic" | "minimalist";
   budget?: "basic" | "standard" | "premium";
+  /** Pre-converted area in m², if the user specified one */
+  areaM2?: number;
 }
 
 export interface GeneratedRoom {
@@ -81,6 +83,8 @@ export interface FloorPlanResult {
   };
   /** Pre-placed furniture items */
   placedFurniture?: PlacedFurniture[];
+  /** Building perimeter polygon (world coords) */
+  buildingPolygon?: Array<{ x: number; y: number }>;
   raw: string;
 }
 
@@ -128,7 +132,7 @@ async function callOpenAI(
         {
           role: "system",
           content:
-            `You are an architectural planner. Output valid JSON only, no markdown.\n\nReturn this abstract plan format (the layout engine computes coordinates):\n${ABSTRACT_PLAN_FORMAT}\n\nRULES:\n- totalArea in m². Convert sq ft (÷10.764).\n- hallwaySide: "center", "left", or "right".\n- zones: room names in each column. Available: frontLeft, leftMiddle, backLeft, frontRight, rightMiddle, backRight.\n- roomRatios: fraction of totalArea for each room. Sum to 1.0 (excl. exterior extensions).\n  Smallest (2-5%): Bathroom, Ensuite, Porch.\n  Medium (8-12%): Bedrooms, Kitchen, Dining.\n  Largest (18-25%): Living Room, Garage. Living Room always largest.\n  Garage ≤ Living Room ratio.\n  1 bath → backRight/backLeft. 2+ baths → 1 near bedrooms + 1 near front.\n  Ensuite ONLY with Master Bedroom in same back zone.\n- exteriorExtensions: Porch=front, Balcony=right/left/back.\n- All bedrooms in backLeft/backRight.\n- Kitchen + Dining on same side (both left or both right).\n- roomShapes (optional): creative shapes for rooms. Values: "rectangle", "l-shape", "bay-window", "angled-corner".\n  Living rooms on exterior → "bay-window". Master bedrooms → "angled-corner". Dining rooms → "l-shape". Kitchens on exterior → "bay-window".`,
+            `You are an architectural planner. Output valid JSON only, no markdown.\n\nReturn this abstract plan format (the layout engine computes coordinates):\n${ABSTRACT_PLAN_FORMAT}\n\nCRITICAL RULES:\n- totalArea MUST be at least 60m². A 2-bedroom house needs at least 80m², 3-bedroom at least 100m². Never return less than 60m².\n- Only include rooms the user explicitly asked for. Do NOT invent rooms.\n- If the user asks for N bedrooms or N bathrooms, you MUST include exactly that many in the zones. Count them and verify.\n- If the user didn't ask for a dining room, don't add one — kitchens serve as dining areas.\n- Master bedroom must always be in backLeft or backRight zone.\n\nDETAILED RULES:\n- totalArea in m². Convert sq ft (÷10.764). If user specifies sq ft, convert to m².\n- hallwaySide: "center", "left", or "right".\n- zones: room names by column. Available slots: frontLeft, leftMiddle, backLeft, frontRight, rightMiddle, backRight.\n- roomRatios: fraction of totalArea for each room. Sum to 1.0 (excl. extensions).\n  Smallest (2-5%): Bathroom, Ensuite, Porch.\n  Medium (8-12%): Bedrooms, Kitchen.\n  Largest (18-25%): Living Room, Garage. Living Room always largest.\n  1 bath → in any back zone. 2 baths → spread across different zones.\n  Ensuite ONLY with Master Bedroom in same zone.\n- exteriorExtensions: Porch=front, Balcony=right/left/back.\n- If user requested dining, place Kitchen + Dining on same side.\n- If user requested garage, place in frontLeft or frontRight.\n- roomShapes (optional): "rectangle", "l-shape", "bay-window", "angled-corner".`,
         },
         { role: "user", content: prompt },
       ],
@@ -160,7 +164,11 @@ export async function generateFloorPlan(
   const style = input.style || "modern";
   const budget = input.budget || "standard";
 
-  const prompt = `USER REQUEST: "${input.description}"\nStyle: ${style} | Budget: ${budget}\n\nReturn the abstract plan JSON. No coordinates — the layout engine handles geometry.`;
+  const areaHint = input.areaM2
+    ? `\nIMPORTANT: The total area MUST be ${input.areaM2}m². Do not use any other value.`
+    : "";
+
+  const prompt = `USER REQUEST: "${input.description}"\nStyle: ${style} | Budget: ${budget}${areaHint}\n\nReturn the abstract plan JSON. No coordinates — the layout engine handles geometry.`;
 
   const raw = await callOpenAI(config, prompt);
   const parsed = JSON.parse(raw);
@@ -170,6 +178,9 @@ export async function generateFloorPlan(
     const layout = computeLayout(parsed as AbstractPlan);
     const furniture = suggestFurniture(layout.rooms);
 
+    // Validate: check which requested rooms couldn't fit
+    const warnings = validateRoomPlacement(input.description, parsed as AbstractPlan, layout.rooms);
+
     return {
       rooms: layout.rooms,
       doors: layout.doors,
@@ -178,14 +189,21 @@ export async function generateFloorPlan(
       sustainabilityScore: parsed.sustainabilityScore || { light: 0.7, ventilation: 0.7, energy: 0.7, overall: 0.7 },
       costEstimate: parsed.costEstimate || { low: 50000, high: 80000, currency: "USD" },
       placedFurniture: furniture,
+      buildingPolygon: layout.buildingPolygon,
       raw,
-      warnings: [],
+      warnings,
     };
   }
 
   // Legacy format
   const legacyRooms: GeneratedRoom[] = parsed.rooms || [];
   const legacyFurniture = suggestFurniture(legacyRooms);
+  // Validate against user description
+  const legacyWarnings = validateRoomPlacement(
+    input.description,
+    { totalArea: 0, hallwayWidth: 1.2, hallwaySide: "center", zones: {}, roomRatios: {}, exteriorExtensions: {} },
+    legacyRooms
+  );
 
   return {
     rooms: legacyRooms,
@@ -199,6 +217,109 @@ export async function generateFloorPlan(
     costEstimate: parsed.costEstimate || { low: 50000, high: 80000, currency: "USD" },
     placedFurniture: legacyFurniture,
     raw,
-    warnings: [],
+    warnings: legacyWarnings,
   };
+}
+
+/* ------------------------------------------------------------------ */
+/*  Validation: check which requested rooms couldn't be placed         */
+/* ------------------------------------------------------------------ */
+
+function validateRoomPlacement(
+  userDescription: string,
+  plan: AbstractPlan,
+  placedRooms: GeneratedRoom[]
+): string[] {
+  const warnings: string[] = [];
+  const desc = userDescription.toLowerCase();
+
+  // ── 0. Check if total area is unreasonably small ──
+  if (plan.totalArea < 60) {
+    warnings.push(
+      `⚠️ The generated plan has only ${plan.totalArea}m² total area (minimum usable is 60m²). ` +
+      `The layout has been scaled up to 100m². Please specify a larger area in your description (e.g., "100 square meters").`
+    );
+  }
+
+  // ── 1. Detect rooms the USER explicitly asked for ──
+  const userRequested: Array<{ keyword: RegExp; label: string }> = [
+    { keyword: /garage|carport|parking/i, label: "Garage / Parking" },
+    { keyword: /dining|dinner/i, label: "Dining room" },
+    { keyword: /office|study|workspace|work room/i, label: "Home office / Study" },
+    { keyword: /laundry|utility|wash room/i, label: "Laundry / Utility room" },
+    { keyword: /ensuite|en-suite|master bath/i, label: "Ensuite bathroom" },
+    { keyword: /walk-in|walk in|closet|wardrobe/i, label: "Walk-in closet" },
+    { keyword: /porch|veranda|terrace/i, label: "Porch / Veranda" },
+    { keyword: /balcony/i, label: "Balcony" },
+    { keyword: /guest/i, label: "Guest room" },
+    { keyword: /pantry|storage/i, label: "Pantry / Storage" },
+  ];
+
+  const placedLower = placedRooms.map(r => r.name.toLowerCase());
+
+  for (const { keyword, label } of userRequested) {
+    if (keyword.test(desc)) {
+      const found = placedLower.some(name => keyword.test(name));
+      if (!found) {
+        warnings.push(
+          `You asked for a "${label}" but it couldn't fit in this floor plan. ` +
+          `Try increasing the total area or reducing other rooms.`
+        );
+      }
+    }
+  }
+
+  // ── 1b. Check bedroom & bathroom counts ──
+  const bedCountMatch = desc.match(/(\d+)\s*-?\s*bed(?:room)?s?/i);
+  const bathCountMatch = desc.match(/(\d+)\s*-?\s*bath(?:room)?s?/i);
+
+  if (bedCountMatch) {
+    const requested = parseInt(bedCountMatch[1]);
+    const placed = placedLower.filter(n => /bedroom|master/i.test(n) && !/bathroom/i.test(n)).length;
+    if (placed < requested) {
+      warnings.push(
+        `You asked for ${requested} bedroom${requested > 1 ? "s" : ""} but only ${placed} could fit. ` +
+        `Try increasing the total area.`
+      );
+    }
+  }
+
+  if (bathCountMatch) {
+    const requested = parseInt(bathCountMatch[1]);
+    const placed = placedLower.filter(n => /bathroom|ensuite|powder|wc/i.test(n)).length;
+    if (placed < requested) {
+      warnings.push(
+        `You asked for ${requested} bathroom${requested > 1 ? "s" : ""} but only ${placed} could fit. ` +
+        `Try increasing the total area.`
+      );
+    }
+  }
+
+  // ── 2. Detect rooms the AI added that user DIDN'T ask for ──
+  const autoAddedPatterns: Array<{ regex: RegExp; label: string; userMustAsk: RegExp }> = [
+    { regex: /dining/i, label: "Dining room", userMustAsk: /dining|dinner/i },
+  ];
+
+  for (const { regex, label, userMustAsk } of autoAddedPatterns) {
+    const wasPlaced = placedLower.some(name => regex.test(name));
+    const userAsked = userMustAsk.test(desc);
+    if (wasPlaced && !userAsked) {
+      warnings.push(
+        `A "${label}" was added but you didn't request one. ` +
+        `Kitchens often serve as dining areas — try omitting the dining room to free up space for other rooms.`
+      );
+    }
+  }
+
+  // ── 3. Check for rooms that are unusually small (under 4m²) ──
+  for (const room of placedRooms) {
+    if (room.area < 4 && !/hallway|corridor|foyer|porch|balcony/i.test(room.name)) {
+      warnings.push(
+        `"${room.name}" is only ${room.area.toFixed(1)}m² — very tight. ` +
+        `Consider a larger total area for more comfortable room sizes.`
+      );
+    }
+  }
+
+  return warnings;
 }
