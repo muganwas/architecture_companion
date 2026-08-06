@@ -89,20 +89,21 @@ export interface FloorPlanResult {
 }
 
 const ABSTRACT_PLAN_FORMAT = `{
-  "totalArea": 100,
+  "totalArea": 150,
   "hallwayWidth": 1.2,
   "hallwaySide": "center",
   "zones": {
+    "frontLeft": ["Garage"],
     "leftMiddle": ["Kitchen"],
     "backLeft": ["Master Bedroom", "Ensuite"],
     "frontRight": ["Living Room"],
     "backRight": ["Bedroom 2", "Bathroom"]
   },
   "roomRatios": {
-    "Living Room": 0.28, "Kitchen": 0.14, "Master Bedroom": 0.18,
-    "Bedroom 2": 0.14, "Bathroom": 0.06, "Ensuite": 0.04
+    "Living Room": 0.22, "Kitchen": 0.12, "Master Bedroom": 0.16,
+    "Bedroom 2": 0.12, "Bathroom": 0.05, "Ensuite": 0.03, "Garage": 0.16
   },
-  "exteriorExtensions": { "Balcony": "right" },
+  "exteriorExtensions": { "Porch": "front" },
   "roomShapes": { "Living Room": "bay-window", "Master Bedroom": "angled-corner" },
   "sustainabilityScore": { "light": 0.8, "ventilation": 0.7, "energy": 0.75, "overall": 0.75 },
   "costEstimate": { "low": 50000, "high": 80000, "currency": "USD" }
@@ -129,7 +130,7 @@ async function callOpenAI(
         {
           role: "system",
           content:
-            `You are an architectural planner. Output valid JSON only, no markdown.\n\nReturn this abstract plan format (the layout engine computes coordinates):\n${ABSTRACT_PLAN_FORMAT}\n\nCRITICAL RULES:\n- totalArea MUST be at least 60m². A 2-bedroom house needs at least 80m², 3-bedroom at least 100m². Never return less than 60m².\n- Only include rooms the user explicitly asked for. Do NOT invent rooms.\n- If the user asks for N bedrooms or N bathrooms, you MUST include exactly that many in the zones. Count them and verify.\n- If the user didn't ask for a dining room, don't add one — kitchens serve as dining areas.\n- Master bedroom must always be in backLeft or backRight zone.\n\nDETAILED RULES:\n- totalArea in m². Convert sq ft (÷10.764). If user specifies sq ft, convert to m².\n- hallwaySide: "center", "left", or "right".\n- zones: room names by column. Available slots: frontLeft, leftMiddle, backLeft, frontRight, rightMiddle, backRight.\n- roomRatios: fraction of totalArea for each room. Sum to 1.0 (excl. extensions).\n  Smallest (2-5%): Bathroom, Ensuite, Porch.\n  Medium (8-12%): Bedrooms, Kitchen.\n  Largest (18-25%): Living Room, Garage. Living Room always largest.\n  1 bath → in any back zone. 2 baths → spread across different zones.\n  Ensuite ONLY with Master Bedroom in same zone.\n- exteriorExtensions: Porch=front, Balcony=right/left/back.\n- If user requested dining, place Kitchen + Dining on same side.\n- If user requested garage, place in frontLeft or frontRight.\n- roomShapes (optional): "rectangle", "l-shape", "bay-window", "angled-corner".`,
+            `You are an architectural planner. Output valid JSON only, no markdown.\n\nReturn this abstract plan format (the layout engine computes coordinates):\n${ABSTRACT_PLAN_FORMAT}\n\nCRITICAL RULES:\n- totalArea MUST be at least 60m². A 2-bedroom house needs at least 80m², 3-bedroom at least 100m². Never return less than 60m².\n- Only include rooms the user explicitly asked for. Do NOT invent rooms (no auto-dining, no auto-guest).\n- If the user asks for N bedrooms, you MUST include exactly N bedrooms (Master Bedroom counts as 1). Count and verify.\n- If the user asks for N bathrooms, Ensuite COUNTS as a bathroom. So "2 bathrooms" with a master = 1 Ensuite + 1 Bathroom. NEVER create duplicate room names.\n- If user asks for a garage, you MUST include it in frontLeft or frontRight zone. It is required, not optional.\n- Master bedroom must always be in backLeft or backRight zone.\n- Living room must be in frontLeft or frontRight (it's the face of the house).\n- No single room should exceed 22% of totalArea. Living room and garage are largest at 18-22%.\n\nDETAILED RULES:\n- totalArea in m². Convert sq ft (÷10.764). If user specifies sq ft, convert to m².\n- hallwaySide: "center", "left", or "right".\n- zones: room names by column. Available slots: frontLeft, leftMiddle, backLeft, frontRight, rightMiddle, backRight.\n- roomRatios: fraction of totalArea for each room. Sum to 1.0 (excl. extensions).\n  Smallest (2-5%): Bathroom, Ensuite, Porch.\n  Medium (8-14%): Bedrooms, Kitchen.\n  Largest (16-22%): Living Room, Garage. Living Room always largest.\n  1 bath → in any back zone. 2 baths (including ensuite) → spread across different zones.\n  Ensuite ONLY with Master Bedroom in same zone.\n- exteriorExtensions: Porch=front, Balcony=right/left/back.\n- If user requested dining, place Kitchen + Dining on same side.\n- If user requested garage, place in frontLeft or frontRight. Garage MUST be included if asked.\n- roomShapes (optional): "rectangle", "l-shape", "bay-window", "angled-corner".`,
         },
         { role: "user", content: prompt },
       ],

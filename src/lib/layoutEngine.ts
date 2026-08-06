@@ -171,11 +171,14 @@ export function computeLayout(plan: AbstractPlan): LayoutResult {
       roomW = Math.max(roomW, minW, minRoomWidth);
       roomH = Math.max(roomH, 2.0);
 
-      // Don't exceed column bounds — last room absorbs ALL remaining space
+      // Don't exceed column bounds
       const remainingH = endY - currentY;
       const isLast = idx === colRoomNames.length - 1;
       if (isLast) {
-        roomH = remainingH; // fill the column completely — no gaps
+        // Last room: take remaining space, but cap at its max area
+        const maxArea = getMaxRoomArea(name);
+        const maxH = maxArea / roomW;
+        roomH = Math.min(remainingH, maxH);
       } else {
         roomH = Math.min(roomH, remainingH - 1.5);
       }
@@ -190,13 +193,10 @@ export function computeLayout(plan: AbstractPlan): LayoutResult {
         }
       }
 
-      // ── Maximum room size caps ── (skip for last room, keep full column width)
-      if (!isLast) {
-        const maxArea = getMaxRoomArea(name);
-        if (roomW * roomH > maxArea) {
-          // Cap height only — keep full column width to avoid gaps to hallway
-          roomH = Math.max(1.5, maxArea / roomW);
-        }
+      // ── Maximum room size caps ── (now applies to ALL rooms including last)
+      const maxArea = getMaxRoomArea(name);
+      if (roomW * roomH > maxArea) {
+        roomH = Math.max(1.5, maxArea / roomW);
       }
 
       rooms.push({
@@ -214,22 +214,74 @@ export function computeLayout(plan: AbstractPlan): LayoutResult {
     return currentY;
   }
 
-  // Place left column rooms — back-to-front: back rooms at top, front rooms at bottom
+  // ── Deduplicate: never allow duplicate room names (two "Bathroom"s) ──
+  const seenNames = new Set<string>();
+  for (const zoneKey of ["frontLeft","leftMiddle","backLeft","frontRight","rightMiddle","backRight"]) {
+    const arr = (zones as Record<string, string[]>)[zoneKey];
+    if (!arr) continue;
+    for (let i = arr.length - 1; i >= 0; i--) {
+      const lower = arr[i].toLowerCase();
+      if (seenNames.has(lower)) {
+        console.warn("[dedupe] removing duplicate \"" + arr[i] + "\" from " + zoneKey);
+        arr.splice(i, 1);
+      } else {
+        seenNames.add(lower);
+      }
+    }
+  }
+
+  // ── Enforce garage always in a front zone ──
+  for (const zoneKey of ["backLeft","leftMiddle","backRight","rightMiddle","frontLeft","frontRight"]) {
+    const arr = (zones as Record<string, string[]>)[zoneKey];
+    if (!arr) continue;
+    const gIdx = arr.findIndex(n => /garage/i.test(n));
+    if (gIdx >= 0 && !zoneKey.startsWith("front")) {
+      const side = zoneKey.includes("Left") ? "frontLeft" : "frontRight";
+      if (!(zones as Record<string, string[]>)[side]) (zones as Record<string, string[]>)[side] = [];
+      (zones as Record<string, string[]>)[side]!.push("Garage");
+      arr.splice(gIdx, 1);
+      console.log("[garage-front] moved garage from " + zoneKey + " to " + side);
+    }
+  }
+
+  // ── Enforce living room always in a front zone ──
+  // The living room is the face of the house — always faces the front.
+  for (const zoneKey of ["backLeft","leftMiddle","backRight","rightMiddle"]) {
+    const arr = (zones as Record<string, string[]>)[zoneKey];
+    if (!arr) continue;
+    const lrIdx = arr.findIndex(n => /living|lounge|family/i.test(n));
+    if (lrIdx >= 0) {
+      const side = zoneKey.includes("Left") ? "frontLeft" : "frontRight";
+      if (!(zones as Record<string, string[]>)[side]) (zones as Record<string, string[]>)[side] = [];
+      const frontZone = (zones as Record<string, string[]>)[side]!;
+      // Swap: living room → front zone, whatever was in front → living's old spot
+      const displaced = frontZone.length > 0 ? frontZone.shift()! : null;
+      frontZone.push(arr[lrIdx]);
+      arr.splice(lrIdx, 1);
+      if (displaced) arr.push(displaced);
+      console.log("[living-front] moved Living Room to " + side + (displaced ? ", swapped with " + displaced : ""));
+      break;
+    }
+  }
+
+  // Place left column rooms — front→back: front rooms at bottom (y=0), back rooms at top
+  // Porch and Balcony are exterior extensions only, never regular rooms
+  const isNotExtension = (n: string) => !/porch|balcony/i.test(n);
   const leftRooms = [
-    ...(zones.backLeft || []),
-    ...(zones.leftMiddle || []),
-    ...(zones.frontLeft || []),
+    ...(zones.frontLeft || []).filter(isNotExtension),
+    ...(zones.leftMiddle || []).filter(isNotExtension),
+    ...(zones.backLeft || []).filter(isNotExtension),
   ];
   let leftEndY = polyBounds.y;
   if (leftRooms.length > 0 && leftZoneWidth >= minRoomWidth) {
     leftEndY = placeColumnBalanced(leftRooms, leftZoneX, leftZoneWidth, polyBounds.y, polyBounds.y + buildingH);
   }
 
-  // Place right column rooms — back-to-front: back rooms at top, front rooms at bottom
+  // Place right column rooms — front→back: front rooms at bottom (y=0), back rooms at top
   const rightRooms = [
-    ...(zones.backRight || []),
-    ...(zones.rightMiddle || []),
-    ...(zones.frontRight || []),
+    ...(zones.frontRight || []).filter(isNotExtension),
+    ...(zones.rightMiddle || []).filter(isNotExtension),
+    ...(zones.backRight || []).filter(isNotExtension),
   ];
   let rightEndY = polyBounds.y;
   if (rightRooms.length > 0 && rightZoneWidth >= minRoomWidth) {
@@ -263,9 +315,13 @@ export function computeLayout(plan: AbstractPlan): LayoutResult {
     if (extRoom) rooms.push(extRoom);
   }
 
-  // Step 6: Generate doors & windows
+  // Step 6: Generate main entrance first, then internal doors, then windows.
+  // Main entrance is placed first so windows can avoid it on the front wall.
+  const mainEntranceDoors = generateMainEntrance(rooms);
   const doors = generateDoors(rooms);
-  const windows = generateWindows(rooms, buildingW, buildingH);
+  for (const d of mainEntranceDoors) doors.push(d);
+  const mainDoor = mainEntranceDoors.find(d => !/porch/i.test(d.room)) ?? null;
+  const windows = generateWindows(rooms, buildingW, buildingH, mainDoor);
 
   // Step 7: Apply creative shapes post-processing (interior shapes only)
   applyCreativeShapes(rooms, plan.roomShapes || {}, buildingW, buildingH);
@@ -574,14 +630,19 @@ function getMinRoomWidth(name: string): number {
   return 2.0;
 }
 
-/** Get maximum area (m²) for a room type — prevents bathrooms/ensuites ballooning */
+/** Get maximum area (m²) for a room type — prevents rooms from ballooning */
 function getMaxRoomArea(name: string): number {
   const n = name.toLowerCase();
   if (/ensuite/i.test(n)) return 5;
   if (/bathroom/i.test(n)) return 8;
   if (/laundry/i.test(n)) return 6;
   if (/office|study/i.test(n)) return 12;
-  return 999; // no cap for other room types
+  if (/bedroom/i.test(n) && !/master/i.test(n)) return 18;
+  if (/master/i.test(n)) return 28;       // master bedroom max ~28m²
+  if (/living|lounge|family/i.test(n)) return 32;  // living room max ~32m²
+  if (/kitchen/i.test(n)) return 20;       // kitchen max ~20m²
+  if (/dining/i.test(n)) return 16;
+  return 999; // garage, hallway, etc. — no cap
 }
 
 /**
@@ -611,6 +672,19 @@ function enforceZeroGapAdjacency(
     room.area = parseFloat((room.width * room.height).toFixed(1));
   }
 
+  // ── Enforce max area caps: trim any room that exceeds its max ──
+  let trimmedTotal = 0;
+  for (const room of colRooms) {
+    const maxArea = getMaxRoomArea(room.name);
+    const currentArea = room.width * room.height;
+    if (currentArea > maxArea + 0.1) {
+      const trimmedH = maxArea / room.width;
+      trimmedTotal += (room.height - trimmedH) * room.width;
+      room.height = parseFloat(trimmedH.toFixed(2));
+      room.area = parseFloat(maxArea.toFixed(1));
+    }
+  }
+
   // Fix stacking: each room starts exactly where the previous one ends
   let expectedY = colStartY;
   for (const room of colRooms) {
@@ -618,11 +692,157 @@ function enforceZeroGapAdjacency(
     expectedY += room.height;
   }
 
-  // If total height < colEndY, give remaining space to the bottom room
-  const lastRoom = colRooms[colRooms.length - 1];
-  if (lastRoom && expectedY < colEndY - TOL) {
-    lastRoom.height += (colEndY - expectedY);
-    lastRoom.area = parseFloat((lastRoom.width * lastRoom.height).toFixed(1));
+  // If total height < colEndY, distribute remaining space among rooms
+  // that haven't hit their max area cap yet (not just the bottom room).
+  const excess = (colEndY - expectedY) + (trimmedTotal / colWidth);
+  if (excess > TOL && colRooms.length > 0) {
+    // Sort by priority: give excess to rooms furthest from their max cap first
+    const eligible = colRooms.map(r => {
+      const maxArea = getMaxRoomArea(r.name);
+      const currentArea = r.width * r.height;
+      const headroom = Math.max(0, maxArea - currentArea);
+      return { room: r, headroom };
+    }).filter(e => e.headroom > 0.1);
+
+    if (eligible.length > 0) {
+      const totalHeadroom = eligible.reduce((s, e) => s + e.headroom, 0);
+      let remaining = excess;
+      for (const e of eligible) {
+        // Distribute proportionally to headroom
+        const share = Math.min(remaining * (e.headroom / totalHeadroom), e.headroom / e.room.width);
+        e.room.height = parseFloat((e.room.height + share).toFixed(2));
+        e.room.area = parseFloat((e.room.width * e.room.height).toFixed(1));
+        remaining -= share * e.room.width;
+      }
+      // Re-stack after redistribution
+      let y = colStartY;
+      for (const room of colRooms) {
+        room.y = y;
+        y += room.height;
+      }
+    }
+    // If no room has headroom left, leave the excess as-is (gap above rooms is fine)
+  }
+}
+
+/**
+ * Ensure the garage (if present) shares an internal wall with the kitchen.
+ *
+ * Runs AFTER zero-gap stacking so room positions are stable.  Strategy:
+ * 1. Find garage & kitchen.  If either is missing or they already share a
+ *    wall, nothing to do.
+ * 2. If they're in the same column but not adjacent, re-order the column
+ *    so kitchen is immediately next to the garage.
+ * 3. If they're in different columns, swap kitchen with the room that is
+ *    directly adjacent to the garage in the garage's column.
+ * 4. After any move, re-stack the affected column(s) via the same zero-gap
+ *    logic so heights stay correct.
+ */
+function enforceKitchenGarageAdjacency(
+  rooms: GeneratedRoom[],
+  leftZoneX: number,
+  leftZoneWidth: number,
+  rightZoneX: number,
+  rightZoneWidth: number,
+  colStartY: number,
+  leftEndY: number,
+  rightEndY: number,
+): void {
+  const TOL = 0.15;
+  const garage = rooms.find(r => /garage/i.test(r.name));
+  const kitchen = rooms.find(r => /kitchen/i.test(r.name));
+  if (!garage || !kitchen) return;
+
+  // Already adjacent?
+  if (findWallBetween(garage, kitchen)) {
+    console.log("[kitchen-garage] already adjacent, nothing to do");
+    return;
+  }
+
+  console.log("[kitchen-garage] NOT adjacent — fixing. garage at", { x: garage.x, y: garage.y, w: garage.width, h: garage.height }, "kitchen at", { x: kitchen.x, y: kitchen.y, w: kitchen.width, h: kitchen.height });
+
+  // Determine which column each is in (after zero-gap, x is exactly colX)
+  const inLeft = (r: GeneratedRoom) => Math.abs(r.x - leftZoneX) < 0.3;
+  const inRight = (r: GeneratedRoom) => Math.abs(r.x - rightZoneX) < 0.3;
+  const garageCol = inLeft(garage) ? "left" : inRight(garage) ? "right" : null;
+  if (!garageCol) return; // shouldn't happen
+
+  const colX = garageCol === "left" ? leftZoneX : rightZoneX;
+  const colW = garageCol === "left" ? leftZoneWidth : rightZoneWidth;
+  const colEndY = garageCol === "left" ? leftEndY : rightEndY;
+
+  // All non-garage, non-kitchen, non-hallway rooms in the garage's column,
+  // sorted bottom→top.
+  const colRooms = rooms
+    .filter(r =>
+      r !== garage && r !== kitchen &&
+      !/hallway|porch|balcony|ensuite/i.test(r.name) &&
+      Math.abs(r.x - colX) < 0.3
+    )
+    .sort((a, b) => a.y - b.y);
+
+  // Find the room directly adjacent to the garage (above or below),
+  // skipping master bedrooms (swapping master would orphan its ensuite).
+  let adjacentRoom: GeneratedRoom | null = null;
+  const isSafeToSwap = (r: GeneratedRoom) => !/master/i.test(r.name);
+  for (const r of colRooms) {
+    if ((Math.abs(r.y - (garage.y + garage.height)) < TOL ||
+         Math.abs(r.y + r.height - garage.y) < TOL) && isSafeToSwap(r)) {
+      adjacentRoom = r;
+      break;
+    }
+  }
+
+  // Fallback: closest safe room in the column
+  if (!adjacentRoom) {
+    const safe = colRooms.filter(isSafeToSwap);
+    if (safe.length > 0) {
+      adjacentRoom = safe.reduce((best, r) => {
+        const dBest = Math.min(
+          Math.abs(best.y - (garage.y + garage.height)),
+          Math.abs(best.y + best.height - garage.y)
+        );
+        const dR = Math.min(
+          Math.abs(r.y - (garage.y + garage.height)),
+          Math.abs(r.y + r.height - garage.y)
+        );
+        return dR < dBest ? r : best;
+      });
+    }
+  }
+
+  if (!adjacentRoom) {
+    console.log("[kitchen-garage] ⚠️ no safe room to swap — skipping force-adjacency, will fall back to hallway door");
+    return;
+  }
+
+  // ── Swap kitchen with the adjacent room ──
+  const kX = kitchen.x, kY = kitchen.y, kW = kitchen.width, kH = kitchen.height;
+  kitchen.x = adjacentRoom.x;
+  kitchen.y = adjacentRoom.y;
+  kitchen.width = adjacentRoom.width;
+  kitchen.height = adjacentRoom.height;
+  kitchen.area = adjacentRoom.area;
+  adjacentRoom.x = kX;
+  adjacentRoom.y = kY;
+  adjacentRoom.width = kW;
+  adjacentRoom.height = kH;
+  adjacentRoom.area = parseFloat((kW * kH).toFixed(1));
+
+  // ── Re-stack BOTH columns so zero-gap holds ──
+  // Garage's column now has kitchen instead of adjacentRoom
+  enforceZeroGapAdjacency(rooms, colX, colW, colStartY, colEndY);
+  // The other column (where adjacentRoom moved) also needs re-stacking
+  const otherColX = garageCol === "left" ? rightZoneX : leftZoneX;
+  const otherColW = garageCol === "left" ? rightZoneWidth : leftZoneWidth;
+  const otherEndY = garageCol === "left" ? rightEndY : leftEndY;
+  enforceZeroGapAdjacency(rooms, otherColX, otherColW, colStartY, otherEndY);
+
+  // Verify adjacency was achieved
+  if (findWallBetween(garage, kitchen)) {
+    console.log("[kitchen-garage] ✅ adjacency fixed. kitchen now at", { x: kitchen.x, y: kitchen.y, w: kitchen.width, h: kitchen.height });
+  } else {
+    console.warn("[kitchen-garage] ❌ FAILED to make kitchen adjacent to garage!");
   }
 }
 
@@ -852,7 +1072,7 @@ function clipRoomToPolygon(
  */
 function createSmartExtension(
   name: string,
-  _side: string,
+  side: string,
   rooms: GeneratedRoom[],
   _buildingPoly: Array<{ x: number; y: number }>
 ): GeneratedRoom | null {
@@ -872,9 +1092,55 @@ function createSmartExtension(
 
   if (!hostRoom) return null;
 
-  // Determine which side of the host room is exterior (find a wall that doesn't touch another room)
-  const extWall = findExteriorWall(hostRoom, rooms);
-  const extW = 1.5;
+  // Porch is ALWAYS at the front (y = -1.5), on the exterior.
+  // The host room determines horizontal placement. If the preferred host
+  // (living/kitchen) isn't at the front, find any room that is.
+  if (isPorch) {
+    const TOL = 0.15;
+    const atFront = (r: GeneratedRoom) => Math.abs(r.y) < TOL;
+
+    if (!atFront(hostRoom)) {
+      // Preferred host isn't at the front — try alternatives.
+      // Priority: kitchen/living at front → hallway → any other room.
+      // NEVER attach porch to a bedroom.
+      const alt = rooms.find(r => atFront(r) && /kitchen/i.test(r.name))
+        || rooms.find(r => atFront(r) && /living|lounge/i.test(r.name))
+        || rooms.find(r => atFront(r) && /hallway/i.test(r.name))
+        || rooms.find(r => atFront(r) && !/porch|balcony|bedroom|ensuite|bathroom/i.test(r.name));
+      if (alt) {
+        console.log(`[porch] host "${hostRoom.name}" not at front, using "${alt.name}" instead`);
+        hostRoom = alt;
+      } else {
+        console.warn(`[porch] ⚠️ no suitable front room for porch — skipped.`);
+        return null;
+      }
+    }
+
+    const extLen = Math.min(hostRoom.width * 0.6, 3.0);
+    return {
+      name,
+      x: hostRoom.x + (hostRoom.width - extLen) / 2,
+      y: -1.5, // absolute front exterior
+      width: extLen,
+      height: 1.5,
+      area: parseFloat((extLen * 1.5).toFixed(1)),
+    };
+  }
+
+  // Balcony can go on any exterior wall.
+  let extWall: "top" | "bottom" | "left" | "right";
+  if (side === "front" || side === "bottom") {
+    extWall = "bottom";
+  } else if (side === "back" || side === "top") {
+    extWall = "top";
+  } else if (side === "left") {
+    extWall = "left";
+  } else if (side === "right") {
+    extWall = "right";
+  } else {
+    extWall = findExteriorWall(hostRoom, rooms);
+  }
+
   const extLen = Math.min(hostRoom.width * 0.6, 3.0);
 
   switch (extWall) {
@@ -887,7 +1153,6 @@ function createSmartExtension(
     case "right":
       return { name, x: hostRoom.x + hostRoom.width, y: hostRoom.y + (hostRoom.height - 2) / 2, width: 1.5, height: 2, area: 3 };
     default:
-      // Fallback: attach to right side
       return { name, x: hostRoom.x + hostRoom.width, y: hostRoom.y + (hostRoom.height - 2) / 2, width: 1.5, height: 2, area: 3 };
   }
 }
@@ -973,31 +1238,48 @@ function generateDoors(rooms: GeneratedRoom[]): Door[] {
         doors.push({ room: room.name, wall: extWall, offset: room.width / 2, width: 2.6, swing: "out" });
       }
 
-      // Internal access door: find ANY adjacent room and place door on shared wall.
-      // Prefer kitchen, then hallway, then any other room.
-      const neighbors = rooms.filter(r =>
-        r !== room && !/porch|balcony/i.test(r.name) && findWallBetween(room, r)
+      // Internal access door: hallway first (garage always opens into hallway),
+      // fall back to kitchen, then any other internal room. NEVER lead outside.
+      const internalNeighbors = rooms.filter(r =>
+        r !== room &&
+        !/porch|balcony/i.test(r.name) &&
+        findWallBetween(room, r)
       );
-      // Sort: kitchen first, then hallway, then others
-      neighbors.sort((a, b) => {
-        const aKit = /kitchen/i.test(a.name) ? 0 : /hallway/i.test(a.name) ? 1 : 2;
-        const bKit = /kitchen/i.test(b.name) ? 0 : /hallway/i.test(b.name) ? 1 : 2;
-        return aKit - bKit;
+      // Sort: hallway first, kitchen second, others last
+      internalNeighbors.sort((a, b) => {
+        const score = (r: GeneratedRoom) =>
+          /hallway/i.test(r.name) ? 0 : /kitchen/i.test(r.name) ? 1 : 2;
+        return score(a) - score(b);
       });
 
-      if (neighbors.length > 0) {
-        const neighbor = neighbors[0];
-        const wall = findWallToHallway(room, neighbor);
+      const internalTarget = internalNeighbors[0] ?? null;
+      if (internalTarget) {
+        const wall = findWallToHallway(room, internalTarget);
         if (wall) {
           const wallLen = wall === "left" || wall === "right" ? room.height : room.width;
+          const offset = Math.max(0.8, wallLen * 0.5);
           doors.push({
             room: room.name,
-            wall: wall,
-            offset: Math.max(0.8, wallLen * 0.5),
+            wall,
+            offset,
             width: 0.9,
             swing: "in",
           });
+          // Also create the door from the neighbor side
+          doors.push({
+            room: internalTarget.name,
+            wall: oppositeWall(wall),
+            offset: (oppositeWall(wall) === "left" || oppositeWall(wall) === "right"
+              ? internalTarget.height : internalTarget.width) * 0.5,
+            width: 0.9,
+            swing: "in",
+          });
+          const targetLabel = /kitchen/i.test(internalTarget.name) ? "kitchen"
+            : /hallway/i.test(internalTarget.name) ? "hallway" : internalTarget.name;
+          console.log(`[generateDoors] garage internal door → ${targetLabel} on wall ${wall}`);
         }
+      } else {
+        console.warn("[generateDoors] ⚠️ garage has NO internal neighbors — no internal door created.");
       }
       continue;
     }
@@ -1072,10 +1354,12 @@ function findWallToHallway(room: GeneratedRoom, neighbor: GeneratedRoom): Door["
   if (Math.abs(room.x + room.width - neighbor.x) < TOL) return "right";
   // neighbor's right edge touches room's left edge → door on room's LEFT wall
   if (Math.abs(neighbor.x + neighbor.width - room.x) < TOL) return "left";
-  // room's bottom edge touches neighbor's top edge → door on room's BOTTOM wall
-  if (Math.abs(room.y + room.height - neighbor.y) < TOL) return "bottom";
-  // neighbor's bottom edge touches room's top edge → door on room's TOP wall
-  if (Math.abs(neighbor.y + neighbor.height - room.y) < TOL) return "top";
+  // room's TOP edge (y+height) touches neighbor's BOTTOM edge (y)
+  // → room is BELOW neighbor → door on room's TOP wall
+  if (Math.abs(room.y + room.height - neighbor.y) < TOL) return "top";
+  // neighbor's TOP edge (y+height) touches room's BOTTOM edge (y)
+  // → room is ABOVE neighbor → door on room's BOTTOM wall
+  if (Math.abs(neighbor.y + neighbor.height - room.y) < TOL) return "bottom";
   return null;
 }
 
@@ -1089,7 +1373,7 @@ function oppositeWall(wall: Door["wall"]): Door["wall"] {
   }
 }
 
-function generateWindows(rooms: GeneratedRoom[], buildingW: number, buildingH: number): Window[] {
+function generateWindows(rooms: GeneratedRoom[], buildingW: number, buildingH: number, mainDoor?: Door | null): Window[] {
   const windows: Window[] = [];
   const TOL = 0.1;
 
@@ -1105,14 +1389,94 @@ function generateWindows(rooms: GeneratedRoom[], buildingW: number, buildingH: n
     if (Math.abs(room.y + room.height - buildingH) < TOL) walls.push({ wall: "top", len: room.width });
 
     for (const { wall, len } of walls) {
+      // If main entrance door is on this room's front wall, place window away from it
+      let wOffset = len * 0.2;
+      let wWidth = Math.min(len * 0.5, 1.8);
+
+      if (mainDoor && mainDoor.room === room.name && mainDoor.wall === wall) {
+        const doorCenter = mainDoor.offset;
+        const doorHalf = mainDoor.width / 2 + 0.15; // small gap between door and window
+        // Place window on the opposite side of the wall from the door
+        if (doorCenter > len / 2) {
+          // Door is on the right half — place window on the left
+          wOffset = Math.max(0.1, len * 0.05);
+          wWidth = Math.min(doorCenter - doorHalf - wOffset, len * 0.35, 1.5);
+        } else {
+          // Door is on the left half — place window on the right
+          wOffset = doorCenter + doorHalf;
+          wWidth = Math.min(len - wOffset - 0.1, len * 0.35, 1.5);
+        }
+        // Skip if window too narrow
+        if (wWidth < 0.4) continue;
+      }
+
       windows.push({
         room: room.name,
         wall,
-        offset: len * 0.2,
-        width: Math.min(len * 0.5, 1.8),
+        offset: wOffset,
+        width: wWidth,
       });
     }
   }
 
   return windows;
+}
+
+/**
+ * Generate the main entrance door on the front of the house.
+ * Priority: living room on front → hallway → any front room.
+ * If a porch exists, the door connects to it.
+ */
+function generateMainEntrance(rooms: GeneratedRoom[]): Door[] {
+  const TOL = 0.1;
+  const porch = rooms.find(r => /porch/i.test(r.name));
+
+  // Find rooms touching the front (y ≈ 0)
+  const frontRooms = rooms.filter(r =>
+    !/porch|balcony/i.test(r.name) && Math.abs(r.y) < TOL
+  );
+
+  // Priority: living room on front → hallway → first available
+  const frontRoom = frontRooms.find(r => /living|lounge|family/i.test(r.name))
+    || frontRooms.find(r => /hallway/i.test(r.name))
+    || frontRooms[0];
+
+  if (!frontRoom) return [];
+
+  const doorWidth = 1.0;
+  // World-x center of the door: align with porch center if present, else room center
+  const doorWorldX = porch
+    ? porch.x + porch.width / 2
+    : frontRoom.x + frontRoom.width / 2;
+
+  // Offset relative to front room's left edge
+  const roomOffset = doorWorldX - frontRoom.x;
+  const clampedOffset = Math.max(0.6, Math.min(roomOffset, frontRoom.width - 0.6));
+
+  const mainDoor: Door = {
+    room: frontRoom.name,
+    wall: "bottom",
+    offset: clampedOffset,
+    width: doorWidth,
+    swing: "in",
+  };
+
+  console.log("[main-entrance] front door on \"" + frontRoom.name + "\" bottom wall, offset=" + clampedOffset.toFixed(2) + (porch ? " (via porch)" : ""));
+
+  // If porch exists, also create the door on the porch side
+  if (porch) {
+    // Same world-x, but relative to porch's left edge
+    const porchOffset = doorWorldX - porch.x;
+    const porchDoor: Door = {
+      room: porch.name,
+      wall: "top",
+      offset: Math.max(0.3, Math.min(porchOffset, porch.width - 0.3)),
+      width: doorWidth,
+      swing: "in",
+    };
+    console.log("[main-entrance] porch-side door on \"" + porch.name + "\" top wall, offset=" + porchDoor.offset.toFixed(2));
+    return [mainDoor, porchDoor];
+  }
+
+  return [mainDoor];
 }

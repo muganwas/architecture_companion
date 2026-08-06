@@ -192,19 +192,69 @@ function renderDoor(
   const gapPoints = doorGapPoly(room, door);
   const gapFlat = worldToScreenFlat(gapPoints, s, bb);
 
-  // ── Garage door: sliding symbol ──
+  // ── Garage door: sectional panel symbol ──
+  // Completely distinct from windows: grey filled panel with horizontal
+  // section lines, thick frame, and slide-direction arrows at the sides.
   if (isGarage) {
-    const slideDir = door.wall === "bottom" || door.wall === "top" ? "h" : "v";
+    const isHoriz = door.wall === "bottom" || door.wall === "top";
+    const doorW = doorLen * s;                   // total door width in px
+    const doorH = isHoriz ? 8 : doorW;           // panel height (thick)
+    const panelW = isHoriz ? doorW : 8;          // panel width
+    const hingePx = hinge;
+    const sections = 4; // number of horizontal/vertical panel sections
+
     return (
       <Group key={`door-${door.room}-${door.wall}`}>
-        {gapFlat.length > 0 && <Line points={gapFlat} closed fill="#fcfcf9" stroke="none" />}
-        <Rect x={hinge.x} y={hinge.y - (slideDir === "h" ? 2 : 0)}
-          width={doorLen * s * 0.9} height={slideDir === "h" ? 4 : doorLen * s * 0.9}
-          fill="transparent" stroke="#888" strokeWidth={0.8} dash={[2, 2]} />
-        <Line points={slideDir === "h"
-          ? [hinge.x - 6, hinge.y - 3, hinge.x - 6, hinge.y + 3, hinge.x, hinge.y]
-          : [hinge.x - 3, hinge.y - 6, hinge.x + 3, hinge.y - 6, hinge.x, hinge.y]}
-          stroke="#888" strokeWidth={0.6} tension={0} closed />
+        {/* Gap in wall for the opening */}
+        {gapFlat.length > 0 && (
+          <Line points={gapFlat} closed fill="#f0ece4" stroke="#999" strokeWidth={0.8} />
+        )}
+        {/* Garage door panel — filled grey rectangle (NOT dashed like windows) */}
+        <Rect
+          x={isHoriz ? hingePx.x : hingePx.x - panelW / 2}
+          y={isHoriz ? hingePx.y - doorH / 2 : hingePx.y}
+          width={isHoriz ? doorW : panelW}
+          height={isHoriz ? doorH : doorW}
+          fill="#d5d0c8"
+          stroke="#777"
+          strokeWidth={1.2}
+          cornerRadius={0.5}
+        />
+        {/* Sectional panel lines */}
+        {Array.from({ length: sections - 1 }, (_, i) => {
+          const t = (i + 1) / sections;
+          const x1 = isHoriz ? hingePx.x + t * doorW : hingePx.x - panelW / 2;
+          const y1 = isHoriz ? hingePx.y - doorH / 2 : hingePx.y + t * doorW;
+          const x2 = isHoriz ? hingePx.x + t * doorW : hingePx.x + panelW / 2;
+          const y2 = isHoriz ? hingePx.y + doorH / 2 : hingePx.y + t * doorW;
+          return <Line key={`sec-${i}`} points={[x1, y1, x2, y2]} stroke="#bbb" strokeWidth={0.6} />;
+        })}
+        {/* Slide-direction arrows at both ends of the door — thick, distinct from window lines */}
+        {[0, 1].map(side => {
+          const cx = isHoriz
+            ? hingePx.x + (side === 0 ? -10 : doorW + 10)
+            : hingePx.x;
+          const cy = isHoriz
+            ? hingePx.y
+            : hingePx.y + (side === 0 ? -10 : doorW + 10);
+          return (
+            <Group key={`arr-${side}`} x={cx} y={cy}>
+              {isHoriz ? (
+                <>
+                  <Line points={[0, -5, 0, 5]} stroke="#555" strokeWidth={1.2} />
+                  <Line points={[side === 0 ? 0 : 0, -3, side === 0 ? -4 : 4, 0]} stroke="#555" strokeWidth={1.2} />
+                  <Line points={[side === 0 ? 0 : 0, 3, side === 0 ? -4 : 4, 0]} stroke="#555" strokeWidth={1.2} />
+                </>
+              ) : (
+                <>
+                  <Line points={[-5, 0, 5, 0]} stroke="#555" strokeWidth={1.2} />
+                  <Line points={[-3, side === 0 ? 0 : 0, 0, side === 0 ? -4 : 4]} stroke="#555" strokeWidth={1.2} />
+                  <Line points={[3, side === 0 ? 0 : 0, 0, side === 0 ? -4 : 4]} stroke="#555" strokeWidth={1.2} />
+                </>
+              )}
+            </Group>
+          );
+        })}
       </Group>
     );
   }
