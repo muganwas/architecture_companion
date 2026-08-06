@@ -170,6 +170,15 @@ function collidesWithExisting(
     if (sameGroup(myItemId, pf.itemId)) continue;
 
     const item = getFurnitureById(pf.itemId);
+    // Virtual obstacle blocks the entire ensuite area
+    if (!item && pf.itemId === "__ensuite_obstacle__") {
+      const obsHalfW = 1.0 + margin; // ensuite half-width (2m wide)
+      const obsHalfH = 1.25 + margin; // ensuite half-height (2.5m tall)
+      if (Math.abs(x - pf.x) < halfW + obsHalfW && Math.abs(y - pf.y) < halfH + obsHalfH) {
+        return true;
+      }
+      continue;
+    }
     if (!item) continue;
 
     const ew = item.width * pf.scale;
@@ -210,7 +219,14 @@ function sameGroup(id1: string, id2: string): boolean {
 export function suggestFurniture(rooms: GeneratedRoom[]): PlacedFurniture[] {
   const placed: PlacedFurniture[] = [];
 
-  for (const room of rooms) {
+  // Sort: ensuite first (so master bedroom furniture can avoid it), then others
+  const sortedRooms = [...rooms].sort((a, b) => {
+    const aEnsuite = /ensuite/i.test(a.name) ? 0 : 1;
+    const bEnsuite = /ensuite/i.test(b.name) ? 0 : 1;
+    return aEnsuite - bEnsuite;
+  });
+
+  for (const room of sortedRooms) {
     const candidates = getFurnitureForRoom(room.name);
     if (candidates.length === 0) continue;
 
@@ -379,6 +395,24 @@ export function suggestFurniture(rooms: GeneratedRoom[]): PlacedFurniture[] {
     /* ---- BEDROOM — guaranteed bed + wardrobe ---- */
     if (/bedroom|master|guest|kids/i.test(name) && !/bathroom|ensuite/i.test(name)) {
       const isMaster = /master/i.test(name);
+
+      // If master bedroom has an ensuite inside it, block that area as an obstacle
+      if (isMaster) {
+        const ensuiteRoom = rooms.find(r => /ensuite/i.test(r.name));
+        if (ensuiteRoom) {
+          // Add a virtual obstacle covering the entire ensuite rectangle
+          // so master bedroom furniture can't be placed there
+          placed.push({
+            itemId: "__ensuite_obstacle__",
+            room: room.name,
+            x: ensuiteRoom.x + ensuiteRoom.width / 2,
+            y: ensuiteRoom.y + ensuiteRoom.height / 2,
+            rotation: 0,
+            scale: 1.0,
+          });
+        }
+      }
+
       const bedId = isMaster ? "bed-queen" : roomArea >= 14 ? "bed-double" : "bed-single";
       const bed = getFurnitureById(bedId);
 
@@ -747,6 +781,11 @@ export function suggestFurniture(rooms: GeneratedRoom[]): PlacedFurniture[] {
     const room = roomMap.get(pf.room);
     if (!room) continue;
     const item = getFurnitureById(pf.itemId);
+    // Allow virtual obstacles to pass through for collision blocking
+    if (!item && pf.itemId === "__ensuite_obstacle__") {
+      validated.push(pf);
+      continue;
+    }
     if (!item) continue;
 
     // Check current placement — swap w/h for 90°/270° rotation
@@ -754,8 +793,9 @@ export function suggestFurniture(rooms: GeneratedRoom[]): PlacedFurniture[] {
     const iw = (isRotated ? item.height : item.width) * pf.scale;
     const ih = (isRotated ? item.width : item.height) * pf.scale;
     const fits = isFurnitureInBounds(pf.x, pf.y, iw, ih, room);
+    const collides = fits && collidesWithExisting(pf.x, pf.y, iw, ih, pf.room, validated, pf.itemId);
 
-    if (fits) {
+    if (fits && !collides) {
       validated.push(pf);
       continue;
     }
