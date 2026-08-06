@@ -53,6 +53,65 @@ function smartPlace(
   return null;
 }
 
+/** Place an item against a wall — tries positions along each wall, never falls back to centroid */
+function wallPlace(
+  itemId: string,
+  room: GeneratedRoom,
+  rotation: number,
+  scale: number,
+  existingItems: PlacedFurniture[]
+): PlacedFurniture | null {
+  const item = getFurnitureById(itemId);
+  if (!item) return null;
+
+  const rw = room.width, rh = room.height;
+  const margin = 0.3;
+
+  // Build wall-adjacent positions using ONLY the specified rotation
+  const positions: Array<{ x: number; y: number; rot: number }> = [];
+  const halfDepth = (rotation === 90 || rotation === 270 ? item.width : item.height) / 2;
+  const halfLength = (rotation === 90 || rotation === 270 ? item.height : item.width) / 2;
+
+  if (rotation === 0 || rotation === 180) {
+    // Horizontal: top and bottom walls
+    positions.push(
+      { x: room.x + rw / 2, y: room.y + margin + halfDepth, rot: 0 },
+      { x: room.x + rw / 2, y: room.y + rh - margin - halfDepth, rot: 0 },
+    );
+  }
+  if (rotation === 90 || rotation === 270) {
+    // Vertical: left and right walls
+    positions.push(
+      { x: room.x + margin + halfDepth, y: room.y + rh / 2, rot: 90 },
+      { x: room.x + rw - margin - halfDepth, y: room.y + rh / 2, rot: 90 },
+    );
+  }
+  // If rotation is something else, try both orientations
+  if (positions.length === 0) {
+    positions.push(
+      { x: room.x + rw / 2, y: room.y + margin + item.height / 2, rot: 0 },
+      { x: room.x + rw / 2, y: room.y + rh - margin - item.height / 2, rot: 0 },
+      { x: room.x + margin + item.height / 2, y: room.y + rh / 2, rot: 90 },
+      { x: room.x + rw - margin - item.height / 2, y: room.y + rh / 2, rot: 90 },
+    );
+  }
+
+  const scales = [scale, scale * 0.85, scale * 0.7, scale * 0.55];
+  for (const s of scales) {
+    for (const pos of positions) {
+      const iw = (pos.rot === 90 || pos.rot === 270 ? item.height : item.width) * s;
+      const ih = (pos.rot === 90 || pos.rot === 270 ? item.width : item.height) * s;
+
+      if (!isFurnitureInBounds(pos.x, pos.y, iw, ih, room)) continue;
+      if (collidesWithExisting(pos.x, pos.y, iw, ih, room.name, existingItems, itemId)) continue;
+
+      return { itemId, room: room.name, x: pos.x, y: pos.y, rotation: pos.rot as 0 | 90 | 180 | 270, scale: s };
+    }
+  }
+
+  return null;
+}
+
 /** Get a point guaranteed to be inside the room's polygon (or rectangle center) */
 function getRoomCentroid(room: GeneratedRoom): { x: number; y: number } {
   if (room.polygon && room.polygon.length >= 3) {
@@ -419,32 +478,14 @@ export function suggestFurniture(rooms: GeneratedRoom[]): PlacedFurniture[] {
       }
     }
 
-    /* ---- KITCHEN — guaranteed counter + stove ---- */
+    /* ---- KITCHEN — single counter via smartPlace ---- */
     if (/kitchen/i.test(name)) {
       const counterId = roomArea < 8 ? "kitchen-counter-small" : "kitchen-counter-straight";
-      // Counter along top wall
-      placed.push({
-        itemId: counterId,
-        room: room.name,
-        x: room.x + rw / 2,
-        y: room.y + 0.35,
-        rotation: 0,
-        scale: roomArea < 8 ? 0.85 : 1.0,
-      });
+      // ONE counter along top wall — use smartPlace for proper bounds & collision
+      const counterResult = smartPlace(counterId, room, room.x + rw / 2, room.y + 0.5, 0, roomArea < 8 ? 0.85 : 0.9, placed);
+      if (counterResult) placed.push(counterResult);
 
-      // Second counter for larger kitchens
-      if (rw >= 3.5 && rh >= 3) {
-        placed.push({
-          itemId: "kitchen-counter-straight",
-          room: room.name,
-          x: room.x + 0.35,
-          y: cy,
-          rotation: 90,
-          scale: 1.0,
-        });
-      }
-
-      // Stove — ALWAYS placed
+      // Stove
       placed.push({
         itemId: "stove-4-burner",
         room: room.name,
@@ -708,9 +749,10 @@ export function suggestFurniture(rooms: GeneratedRoom[]): PlacedFurniture[] {
     const item = getFurnitureById(pf.itemId);
     if (!item) continue;
 
-    // Check current placement
-    const iw = item.width * pf.scale;
-    const ih = item.height * pf.scale;
+    // Check current placement — swap w/h for 90°/270° rotation
+    const isRotated = pf.rotation === 90 || pf.rotation === 270;
+    const iw = (isRotated ? item.height : item.width) * pf.scale;
+    const ih = (isRotated ? item.width : item.height) * pf.scale;
     const fits = isFurnitureInBounds(pf.x, pf.y, iw, ih, room);
 
     if (fits) {

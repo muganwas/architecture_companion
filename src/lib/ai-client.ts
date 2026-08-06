@@ -89,24 +89,21 @@ export interface FloorPlanResult {
 }
 
 const ABSTRACT_PLAN_FORMAT = `{
-  "totalArea": 140,
+  "totalArea": 100,
   "hallwayWidth": 1.2,
   "hallwaySide": "center",
   "zones": {
-    "frontLeft": ["Garage"],
     "leftMiddle": ["Kitchen"],
     "backLeft": ["Master Bedroom", "Ensuite"],
     "frontRight": ["Living Room"],
-    "rightMiddle": ["Dining"],
     "backRight": ["Bedroom 2", "Bathroom"]
   },
   "roomRatios": {
-    "Living Room": 0.25, "Kitchen": 0.11, "Master Bedroom": 0.14,
-    "Bedroom 2": 0.10, "Bathroom": 0.05, "Ensuite": 0.04,
-    "Dining": 0.10, "Garage": 0.21
+    "Living Room": 0.28, "Kitchen": 0.14, "Master Bedroom": 0.18,
+    "Bedroom 2": 0.14, "Bathroom": 0.06, "Ensuite": 0.04
   },
-  "exteriorExtensions": { "Porch": "front", "Balcony": "right" },
-  "roomShapes": { "Living Room": "bay-window", "Master Bedroom": "angled-corner", "Dining": "l-shape" },
+  "exteriorExtensions": { "Balcony": "right" },
+  "roomShapes": { "Living Room": "bay-window", "Master Bedroom": "angled-corner" },
   "sustainabilityScore": { "light": 0.8, "ventilation": 0.7, "energy": 0.75, "overall": 0.75 },
   "costEstimate": { "low": 50000, "high": 80000, "currency": "USD" }
 }`;
