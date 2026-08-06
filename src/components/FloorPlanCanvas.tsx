@@ -1,7 +1,7 @@
 "use client";
 
 import React, { useMemo, useState, useCallback } from "react";
-import { Stage, Layer, Group, Rect, Line, Circle, Text } from "react-konva";
+import { Stage, Layer, Group, Rect, Line, Circle, Text, Arc } from "react-konva";
 import { GeneratedRoom, Door, Window } from "@/lib/ai-client";
 import { PlacedFurniture, getFurnitureById } from "@/lib/furniture";
 
@@ -103,6 +103,137 @@ function doorGapPoly(room: GeneratedRoom, door: Door): Array<{ x: number; y: num
     ];
     default: return [];
   }
+}
+
+/** Render a single door as a proper architectural floor-plan symbol.
+ *  Standard door: partially-open panel (60°) + swing arc from panel tip to latch.
+ *  Garage door: sliding symbol (no swing). */
+function renderDoor(
+  room: GeneratedRoom, door: Door, s: number, bb: BBox
+): React.ReactNode {
+  const { x: rx, y: ry, width: rw, height: rh } = room;
+  const gapHw = door.width / 2;
+  const off = door.offset;
+  const isGarage = door.width >= 2.0;
+  const stopLen = 0.06;
+
+  // Hinge is always on the LEFT side of the gap (standard convention)
+  // Latch is on the RIGHT side
+  let hingeX: number, hingeY: number, latchX: number, latchY: number;
+  let inDirX: number, inDirY: number; // unit vector pointing INTO the room from the wall
+  let alongDirX: number, alongDirY: number; // unit vector along the wall (hinge→latch direction)
+
+  switch (door.wall) {
+    case "bottom":
+      hingeX = rx + off - gapHw; hingeY = ry;
+      latchX = rx + off + gapHw; latchY = ry;
+      inDirX = 0; inDirY = 1; // into room = up
+      alongDirX = 1; alongDirY = 0; // along wall = right
+      break;
+    case "top":
+      hingeX = rx + off - gapHw; hingeY = ry + rh;
+      latchX = rx + off + gapHw; latchY = ry + rh;
+      inDirX = 0; inDirY = -1; // into room = down
+      alongDirX = 1; alongDirY = 0;
+      break;
+    case "left":
+      hingeX = rx; hingeY = ry + off - gapHw;
+      latchX = rx; latchY = ry + off + gapHw;
+      inDirX = 1; inDirY = 0; // into room = right
+      alongDirX = 0; alongDirY = 1; // along wall = up
+      break;
+    case "right":
+      hingeX = rx + rw; hingeY = ry + off - gapHw;
+      latchX = rx + rw; latchY = ry + off + gapHw;
+      inDirX = -1; inDirY = 0; // into room = left
+      alongDirX = 0; alongDirY = 1;
+      break;
+    default: return null;
+  }
+
+  const swingIn = door.swing !== "out";
+  const inSign = swingIn ? 1 : -1;
+  const doorLen = door.width;
+
+  const hinge = toCanvas(hingeX, hingeY, s, bb);
+  const arcR = doorLen * s;
+
+  // ── Screen-space direction vectors ──
+  // toCanvas flips Y: screenY = STAGE_H - PAD - (worldY - bb.y) * s
+  // so a world vector (dx, dy) → screen vector (dx*s, -dy*s). Normalising: (dx, -dy).
+  const alongDX = alongDirX;           // X unchanged
+  const alongDY = -alongDirY;          // Y flipped for screen
+  const inDX = inDirX;
+  const inDY = -inDirY;
+
+  // ── Latch position in screen coords (relative to hinge) ──
+  const latchRelX = arcR * alongDX;
+  const latchRelY = arcR * alongDY;
+
+  // ── Door tip: 45° from closed direction toward room interior ──
+  const cos45 = Math.cos(Math.PI / 4);
+  const sin45 = Math.sin(Math.PI / 4);
+  const tipRelX = arcR * (cos45 * alongDX + inSign * sin45 * inDX);
+  const tipRelY = arcR * (cos45 * alongDY + inSign * sin45 * inDY);
+
+  // ── Arc: 45° sweep from latch (closed) to tip (open), centred at hinge ──
+  const angleClosed = Math.atan2(alongDY, alongDX);       // direction of latch
+  const angleOpen   = Math.atan2(tipRelY / arcR, tipRelX / arcR); // direction of tip
+
+  const arcSteps = 12;
+  const arcPoints: number[] = [];
+  for (let i = 0; i <= arcSteps; i++) {
+    const t = i / arcSteps;
+    const a = angleClosed + (angleOpen - angleClosed) * t;
+    arcPoints.push(arcR * Math.cos(a), arcR * Math.sin(a));
+  }
+
+  // Wall gap — absolute screen coords
+  const gapPoints = doorGapPoly(room, door);
+  const gapFlat = worldToScreenFlat(gapPoints, s, bb);
+
+  // ── Garage door: sliding symbol ──
+  if (isGarage) {
+    const slideDir = door.wall === "bottom" || door.wall === "top" ? "h" : "v";
+    return (
+      <Group key={`door-${door.room}-${door.wall}`}>
+        {gapFlat.length > 0 && <Line points={gapFlat} closed fill="#fcfcf9" stroke="none" />}
+        <Rect x={hinge.x} y={hinge.y - (slideDir === "h" ? 2 : 0)}
+          width={doorLen * s * 0.9} height={slideDir === "h" ? 4 : doorLen * s * 0.9}
+          fill="transparent" stroke="#888" strokeWidth={0.8} dash={[2, 2]} />
+        <Line points={slideDir === "h"
+          ? [hinge.x - 6, hinge.y - 3, hinge.x - 6, hinge.y + 3, hinge.x, hinge.y]
+          : [hinge.x - 3, hinge.y - 6, hinge.x + 3, hinge.y - 6, hinge.x, hinge.y]}
+          stroke="#888" strokeWidth={0.6} tension={0} closed />
+      </Group>
+    );
+  }
+
+  // ── Standard swing door ──
+  return (
+    <Group key={`door-${door.room}-${door.wall}`}>
+      {/* Wall gap — white fill + thin outline so the doorway opening is always visible */}
+      {gapFlat.length > 0 && (
+        <>
+          <Line points={gapFlat} closed fill="#fcfcf9" stroke="#bbb" strokeWidth={0.5} />
+          {/* Doorframe ticks at each end of the gap */}
+          <Line points={[gapFlat[0], gapFlat[1], gapFlat[6], gapFlat[7]]} stroke="#666" strokeWidth={1} />
+          <Line points={[gapFlat[2], gapFlat[3], gapFlat[4], gapFlat[5]]} stroke="#666" strokeWidth={1} />
+        </>
+      )}
+      {/* Door geometry — all relative to hinge position */}
+      <Group x={hinge.x} y={hinge.y}>
+        {/* Doorway plane (closed position): hinge → latch, subtle dashed reference line */}
+        <Line points={[0, 0, latchRelX, latchRelY]} stroke="#aaa" strokeWidth={0.8} dash={[4, 4]} />
+        {/* Door panel (open position): hinge → tip, 45° from doorway plane */}
+        <Line points={[0, 0, tipRelX, tipRelY]} stroke="#333" strokeWidth={2} />
+        {/* Swing arc: latch → tip, the 45° sweep */}
+        <Line points={arcPoints} stroke="#e63946" strokeWidth={2.5} dash={[5, 3]} tension={0.5} />
+        {/* Small hinge dot */}
+        <Circle x={0} y={0} radius={2} fill="#333" stroke="none" />
+      </Group>
+    </Group>
+  );
 }
 
 /** Flatten world-point array → Konva flat [x1,y1,x2,y2,...] in screen coords */
@@ -648,16 +779,18 @@ export default function FloorPlanCanvas({
                         shadowOpacity={isHovered ? 0.35 : 0}
                       />
 
-                      {/* Door gaps */}
-                      {doors.filter(d => d.room === room.name && !isHall).map((door, di) => {
-                        const dp = doorGapPoly(room, door);
-                        if (dp.length === 0) return null;
-                        const fp = worldToScreenFlat(dp, s, bb);
-                        return <Line key={`dg-${di}`} points={fp} closed fill="#fcfcf9" stroke="none" />;
-                      })}
+                      {/* Doors — proper architectural symbols */}
+                {doors.filter(d => {
+                  const room = roomMap.get(d.room);
+                  return room && parts.some(p => p.name === room.name);
+                }).map((door, di) => {
+                  const room = roomMap.get(door.room)!;
+                  if (/hallway|corridor|foyer/i.test(room.name)) return null;
+                  return renderDoor(room, door, s, bb);
+                })}
 
-                      {/* Window markers */}
-                      {windows.filter(w => w.room === room.name).map((win, wi) => {
+                {/* Window markers */}
+                {windows.filter(w => w.room === room.name).map((win, wi) => {
                         const { x: rx, y: ry, width: rw, height: rh } = room;
                         const off = win.offset;
                         const ww = (win.width * s) / 2;
@@ -683,33 +816,6 @@ export default function FloorPlanCanvas({
                         );
                       })}
                     </Group>
-                  );
-                })}
-
-                {/* Door swing arcs */}
-                {doors.filter(d => {
-                  const room = roomMap.get(d.room);
-                  return room && parts.some(p => p.name === room.name) && !/hallway|corridor|foyer/i.test(d.room);
-                }).map((door, di) => {
-                  const room = roomMap.get(door.room)!;
-                  const { x: rx, y: ry, width: rw, height: rh } = room;
-                  const off = door.offset;
-                  const dw = (door.width * s) / 2;
-                  let ax: number, ay: number;
-                  switch (door.wall) {
-                    case "bottom": { const p = toCanvas(rx + off, ry, s, bb); ax = p.x; ay = p.y; break; }
-                    case "top": { const p = toCanvas(rx + off, ry + rh, s, bb); ax = p.x; ay = p.y; break; }
-                    case "left": { const p = toCanvas(rx, ry + off, s, bb); ax = p.x; ay = p.y; break; }
-                    case "right": { const p = toCanvas(rx + rw, ry + off, s, bb); ax = p.x; ay = p.y; break; }
-                    default: ax = 0; ay = 0;
-                  }
-                  return (
-                    <Line key={`dsw-${di}`} stroke="#999" strokeWidth={1} dash={[3, 2]}
-                      points={
-                        door.wall === "left" || door.wall === "right"
-                          ? [ax, ay - dw, ax - dw, ay - dw]
-                          : [ax - dw, ay, ax - dw, ay - dw]
-                      } />
                   );
                 })}
 
