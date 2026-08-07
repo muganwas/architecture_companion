@@ -309,19 +309,22 @@ export function computeLayout(plan: AbstractPlan): LayoutResult {
   // Clipping destroys usable room area and creates gaps between rooms.
   // The polygon is rendered as a subtle dashed outline for visual interest.
 
-  // Step 5: Add exterior extensions (porch, balcony) attached to appropriate rooms
+  // Step 5: Add exterior extensions (porch, balcony) attached to appropriate rooms.
+  // Multiple balconies get different hosts (living room first, then master bedroom, etc.)
+  const usedHosts = new Set<string>();
   for (const [roomName, side] of Object.entries(exteriorExtensions)) {
-    const extRoom = createSmartExtension(roomName, side, rooms, []);
+    const extRoom = createSmartExtension(roomName, side, rooms, [], usedHosts);
     if (extRoom) rooms.push(extRoom);
   }
 
-  // Step 6: Generate main entrance first, then internal doors, then windows.
-  // Main entrance is placed first so windows can avoid it on the front wall.
+  // Step 6: Generate main entrance first, then internal doors, balcony doors, then windows.
+  // All doors must be known before windows so windows can avoid overlapping any door.
   const mainEntranceDoors = generateMainEntrance(rooms);
   const doors = generateDoors(rooms);
   for (const d of mainEntranceDoors) doors.push(d);
-  const mainDoor = mainEntranceDoors.find(d => !/porch/i.test(d.room)) ?? null;
-  const windows = generateWindows(rooms, buildingW, buildingH, mainDoor);
+  const balconyDoors = generateBalconyDoors(rooms);
+  for (const d of balconyDoors) doors.push(d);
+  const windows = generateWindows(rooms, buildingW, buildingH, doors);
 
   // Step 7: Apply creative shapes post-processing (interior shapes only)
   applyCreativeShapes(rooms, plan.roomShapes || {}, buildingW, buildingH);
@@ -1067,22 +1070,29 @@ function clipRoomToPolygon(
 /** Create exterior extension relative to the building polygon */
 /**
  * Attach an exterior extension (porch/balcony) to the most appropriate room.
- * Balcony → living room (or master bedroom if no living room).
+ * Balcony → living room (priority 1), then master bedroom, then any bedroom.
  * Porch → front of house, attached to living room or kitchen.
+ * Multiple balconies get different hosts via the usedHosts set.
  */
 function createSmartExtension(
   name: string,
   side: string,
   rooms: GeneratedRoom[],
-  _buildingPoly: Array<{ x: number; y: number }>
+  _buildingPoly: Array<{ x: number; y: number }>,
+  usedHosts: Set<string> = new Set()
 ): GeneratedRoom | null {
   const isBalcony = /balcony/i.test(name);
   const isPorch = /porch/i.test(name);
 
-  // Find the host room
+  // Find the host room, skipping already-used hosts for balconies
   let hostRoom: GeneratedRoom | undefined;
   if (isBalcony) {
-    hostRoom = rooms.find(r => /living|lounge|family/i.test(r.name))
+    // Priority: living room → master → any bedroom, but prefer unused rooms
+    hostRoom = rooms.find(r => /living|lounge|family/i.test(r.name) && !usedHosts.has(r.name))
+            || rooms.find(r => /master/i.test(r.name) && !usedHosts.has(r.name))
+            || rooms.find(r => /bedroom/i.test(r.name) && !usedHosts.has(r.name))
+            // Fall back to any room even if already used
+            || rooms.find(r => /living|lounge|family/i.test(r.name))
             || rooms.find(r => /master/i.test(r.name))
             || rooms.find(r => /bedroom/i.test(r.name));
   } else if (isPorch) {
@@ -1091,6 +1101,9 @@ function createSmartExtension(
   }
 
   if (!hostRoom) return null;
+
+  // Track which host was used (for multiple balcony support)
+  usedHosts.add(hostRoom.name);
 
   // Porch is ALWAYS at the front (y = -1.5), on the exterior.
   // The host room determines horizontal placement. If the preferred host
@@ -1128,16 +1141,16 @@ function createSmartExtension(
   }
 
   // Balcony can go on any exterior wall.
+  // Validate that the LLM-specified side actually points to an exterior wall;
+  // if not (e.g., "back" on a room whose top wall is interior), fall back.
   let extWall: "top" | "bottom" | "left" | "right";
-  if (side === "front" || side === "bottom") {
-    extWall = "bottom";
-  } else if (side === "back" || side === "top") {
-    extWall = "top";
-  } else if (side === "left") {
-    extWall = "left";
-  } else if (side === "right") {
-    extWall = "right";
+  const candidateWall = mapSideToWall(side);
+  if (candidateWall && isExteriorWall(hostRoom, candidateWall, rooms)) {
+    extWall = candidateWall;
   } else {
+    if (candidateWall) {
+      console.log(`[balcony] "${name}" side "${side}" → wall "${candidateWall}" is NOT exterior on "${hostRoom.name}", falling back to auto-detect`);
+    }
     extWall = findExteriorWall(hostRoom, rooms);
   }
 
@@ -1157,12 +1170,70 @@ function createSmartExtension(
   }
 }
 
-/** Find which wall of a room is on the exterior (doesn't touch another room) */
-function findExteriorWall(room: GeneratedRoom, allRooms: GeneratedRoom[]): "top" | "bottom" | "left" | "right" {
+/** Map a user-facing side name to a wall direction, or null if unrecognized. */
+function mapSideToWall(side: string): "top" | "bottom" | "left" | "right" | null {
+  if (side === "front" || side === "bottom") return "bottom";
+  if (side === "back" || side === "top") return "top";
+  if (side === "left") return "left";
+  if (side === "right") return "right";
+  return null;
+}
+
+/** Check whether a given wall of a room is on the building exterior. */
+function isExteriorWall(
+  room: GeneratedRoom,
+  wall: "top" | "bottom" | "left" | "right",
+  allRooms: GeneratedRoom[]
+): boolean {
   const TOL = 0.15;
   const neighbors = allRooms.filter(r => r !== room && !/porch|balcony/i.test(r.name));
 
-  // Check each wall - if no neighbor touches it, it's exterior
+  // Compute building extents from interior rooms
+  let maxX = 0, maxY = 0, minX = Infinity, minY = Infinity;
+  for (const r of neighbors) {
+    if (r.x < minX) minX = r.x;
+    if (r.y < minY) minY = r.y;
+    if (r.x + r.width > maxX) maxX = r.x + r.width;
+    if (r.y + r.height > maxY) maxY = r.y + r.height;
+  }
+
+  switch (wall) {
+    case "bottom": {
+      // Must be at building bottom edge AND no room below
+      const atPerimeter = Math.abs(room.y - minY) < TOL;
+      const hasNeighborBelow = neighbors.some(r => Math.abs(room.y - (r.y + r.height)) < TOL);
+      return atPerimeter && !hasNeighborBelow;
+    }
+    case "top": {
+      const atPerimeter = Math.abs(room.y + room.height - maxY) < TOL;
+      const hasNeighborAbove = neighbors.some(r => Math.abs(room.y + room.height - r.y) < TOL);
+      return atPerimeter && !hasNeighborAbove;
+    }
+    case "left": {
+      const atPerimeter = Math.abs(room.x - minX) < TOL;
+      const hasNeighborLeft = neighbors.some(r => Math.abs(room.x - (r.x + r.width)) < TOL);
+      return atPerimeter && !hasNeighborLeft;
+    }
+    case "right": {
+      const atPerimeter = Math.abs(room.x + room.width - maxX) < TOL;
+      const hasNeighborRight = neighbors.some(r => Math.abs(room.x + room.width - r.x) < TOL);
+      return atPerimeter && !hasNeighborRight;
+    }
+  }
+}
+
+/** Find which wall of a room is on the exterior (doesn't touch another room AND is at building perimeter).
+ *  Prefers bottom (front) and right walls, then left, then top. */
+function findExteriorWall(room: GeneratedRoom, allRooms: GeneratedRoom[]): "top" | "bottom" | "left" | "right" {
+  // Try preferred walls first using the robust perimeter check
+  if (isExteriorWall(room, "bottom", allRooms)) return "bottom";
+  if (isExteriorWall(room, "right", allRooms)) return "right";
+  if (isExteriorWall(room, "left", allRooms)) return "left";
+  if (isExteriorWall(room, "top", allRooms)) return "top";
+
+  // Fallback: old adjacency-only check (for edge cases)
+  const TOL = 0.15;
+  const neighbors = allRooms.filter(r => r !== room && !/porch|balcony/i.test(r.name));
   const hasBottomNeighbor = neighbors.some(r => Math.abs(room.y - (r.y + r.height)) < TOL);
   const hasTopNeighbor = neighbors.some(r => Math.abs(room.y + room.height - r.y) < TOL);
   const hasLeftNeighbor = neighbors.some(r => Math.abs(room.x - (r.x + r.width)) < TOL);
@@ -1172,7 +1243,7 @@ function findExteriorWall(room: GeneratedRoom, allRooms: GeneratedRoom[]): "top"
   if (!hasRightNeighbor) return "right";
   if (!hasLeftNeighbor) return "left";
   if (!hasTopNeighbor) return "top";
-  return "right"; // default
+  return "right"; // absolute last resort
 }
 
 /* ------------------------------------------------------------------ */
@@ -1285,28 +1356,51 @@ function generateDoors(rooms: GeneratedRoom[]): Door[] {
     }
 
     // Standard room: door to hallway
-    // Ensuite connects to master bedroom, not hallway
+    // Ensuite connects to master bedroom, not hallway.
+    // The ensuite is carved inside the master, so edges don't touch exactly —
+    // we find the interior-facing wall and place the door there.
     if (/ensuite/i.test(room.name)) {
       const master = rooms.find(r => /master/i.test(r.name));
       if (master) {
-        const wall = findWallToHallway(room, master);
+        // Compute building extents to determine which walls are exterior
+        let maxX = 0, maxY = 0;
+        for (const r of rooms) {
+          if (r.x + r.width > maxX) maxX = r.x + r.width;
+          if (r.y + r.height > maxY) maxY = r.y + r.height;
+        }
+        const EXT_TOL = 0.1;
+
+        // Find an interior wall (not on building perimeter) for the door
+        const interiorWalls: Door["wall"][] = [];
+        if (!(Math.abs(room.x) < EXT_TOL)) interiorWalls.push("left");
+        if (!(Math.abs(room.x + room.width - maxX) < EXT_TOL)) interiorWalls.push("right");
+        if (!(Math.abs(room.y) < EXT_TOL)) interiorWalls.push("bottom");
+        if (!(Math.abs(room.y + room.height - maxY) < EXT_TOL)) interiorWalls.push("top");
+
+        // Prefer top wall (faces main bedroom area), then any interior wall
+        const wall: Door["wall"] | null =
+          interiorWalls.includes("top") ? "top" :
+          interiorWalls.includes("bottom") ? "bottom" :
+          interiorWalls.includes("left") ? "left" :
+          interiorWalls.includes("right") ? "right" :
+          null;
+
         if (wall) {
           const wallLen = wall === "left" || wall === "right" ? room.height : room.width;
+          const doorWidth = 0.75;
+          const doorOffset = Math.max(doorWidth / 2 + 0.15, Math.min(wallLen - doorWidth / 2 - 0.15, wallLen * 0.5));
+
           doors.push({
             room: room.name,
             wall,
-            offset: Math.max(0.5, wallLen * 0.5),
-            width: 0.75,
+            offset: doorOffset,
+            width: doorWidth,
             swing: "in",
           });
-          // Also add door from master to ensuite
-          doors.push({
-            room: master.name,
-            wall: oppositeWall(wall),
-            offset: Math.max(0.5, (wall === "left" || wall === "right" ? master.height : master.width) * 0.5),
-            width: 0.75,
-            swing: "in",
-          });
+          // Note: no master-side door — the ensuite is carved inside the master,
+          // so the ensuite door alone shows the access point. A master-side door
+          // would be placed on an exterior wall (oppositeWall of an interior wall
+          // = exterior), creating a phantom door to the outside.
         }
       }
       continue;
@@ -1373,9 +1467,11 @@ function oppositeWall(wall: Door["wall"]): Door["wall"] {
   }
 }
 
-function generateWindows(rooms: GeneratedRoom[], buildingW: number, buildingH: number, mainDoor?: Door | null): Window[] {
+function generateWindows(rooms: GeneratedRoom[], buildingW: number, buildingH: number, allDoors: Door[]): Window[] {
   const windows: Window[] = [];
   const TOL = 0.1;
+  const WALL_MARGIN = 0.2; // minimum distance from room edge to window edge
+  const DOOR_GAP = 0.15;   // minimum gap between door edge and window edge
 
   for (const room of rooms) {
     if (/hallway|corridor|foyer|garage|porch|balcony/i.test(room.name)) continue;
@@ -1389,26 +1485,57 @@ function generateWindows(rooms: GeneratedRoom[], buildingW: number, buildingH: n
     if (Math.abs(room.y + room.height - buildingH) < TOL) walls.push({ wall: "top", len: room.width });
 
     for (const { wall, len } of walls) {
-      // If main entrance door is on this room's front wall, place window away from it
-      let wOffset = len * 0.2;
-      let wWidth = Math.min(len * 0.5, 1.8);
+      // Collect all doors on this room + wall
+      const wallDoors = allDoors
+        .filter(d => d.room === room.name && d.wall === wall)
+        .sort((a, b) => a.offset - b.offset);
 
-      if (mainDoor && mainDoor.room === room.name && mainDoor.wall === wall) {
-        const doorCenter = mainDoor.offset;
-        const doorHalf = mainDoor.width / 2 + 0.15; // small gap between door and window
-        // Place window on the opposite side of the wall from the door
-        if (doorCenter > len / 2) {
-          // Door is on the right half — place window on the left
-          wOffset = Math.max(0.1, len * 0.05);
-          wWidth = Math.min(doorCenter - doorHalf - wOffset, len * 0.35, 1.5);
-        } else {
-          // Door is on the left half — place window on the right
-          wOffset = doorCenter + doorHalf;
-          wWidth = Math.min(len - wOffset - 0.1, len * 0.35, 1.5);
+      // Build occupied segments: each door blocks [doorOffset - halfW - gap, doorOffset + halfW + gap]
+      interface Segment { start: number; end: number; }
+      const occupied: Segment[] = wallDoors.map(d => ({
+        start: d.offset - d.width / 2 - DOOR_GAP,
+        end: d.offset + d.width / 2 + DOOR_GAP,
+      }));
+
+      // Find free segments with at least WALL_MARGIN from edges
+      const freeSegments: Segment[] = [];
+      let cursor = WALL_MARGIN;
+      for (const seg of occupied) {
+        if (seg.start > cursor + 0.4) {
+          // Gap large enough for a window
+          freeSegments.push({ start: cursor, end: Math.min(seg.start, len - WALL_MARGIN) });
         }
-        // Skip if window too narrow
-        if (wWidth < 0.4) continue;
+        cursor = Math.max(cursor, seg.end);
       }
+      // Remaining space after last door
+      if (cursor < len - WALL_MARGIN - 0.4) {
+        freeSegments.push({ start: cursor, end: len - WALL_MARGIN });
+      }
+
+      if (freeSegments.length === 0) continue; // no room for a window
+
+      // Pick the largest free segment
+      freeSegments.sort((a, b) => (b.end - b.start) - (a.end - a.start));
+      const best = freeSegments[0];
+      const availableLen = best.end - best.start;
+
+      let wWidth = Math.min(availableLen * 0.7, 1.8);
+      if (wWidth < 0.4) continue;
+
+      // Center the window in the available gap
+      let wOffset = best.start + availableLen / 2;
+
+      // ── Clamp window to stay entirely within this room's wall segment ──
+      const halfW = wWidth / 2;
+      const minOffset = WALL_MARGIN + halfW;
+      const maxOffset = len - WALL_MARGIN - halfW;
+      wOffset = Math.max(minOffset, Math.min(maxOffset, wOffset));
+
+      // Re-verify window doesn't overlap any door
+      const overlapsDoor = wallDoors.some(d =>
+        Math.abs(wOffset - d.offset) < halfW + d.width / 2 + DOOR_GAP
+      );
+      if (overlapsDoor) continue;
 
       windows.push({
         room: room.name,
@@ -1463,20 +1590,54 @@ function generateMainEntrance(rooms: GeneratedRoom[]): Door[] {
 
   console.log("[main-entrance] front door on \"" + frontRoom.name + "\" bottom wall, offset=" + clampedOffset.toFixed(2) + (porch ? " (via porch)" : ""));
 
-  // If porch exists, also create the door on the porch side
-  if (porch) {
-    // Same world-x, but relative to porch's left edge
-    const porchOffset = doorWorldX - porch.x;
-    const porchDoor: Door = {
-      room: porch.name,
-      wall: "top",
-      offset: Math.max(0.3, Math.min(porchOffset, porch.width - 0.3)),
+  // Only the host-room door is created — the porch is an exterior extension,
+  // so a single door on the interior room shows the access point.
+  return [mainDoor];
+}
+
+/**
+ * Generate doors for all balconies connecting to their host rooms.
+ * Each balcony gets a door on the shared wall with its host (living room,
+ * master bedroom, etc.). Supports multiple balconies.
+ */
+function generateBalconyDoors(rooms: GeneratedRoom[]): Door[] {
+  const doors: Door[] = [];
+  const balconies = rooms.filter(r => /balcony/i.test(r.name));
+
+  for (const balcony of balconies) {
+    // Find the interior room this balcony is attached to
+    const host = rooms.find(r =>
+      r !== balcony &&
+      !/porch|balcony/i.test(r.name) &&
+      findWallToHallway(balcony, r) !== null
+    );
+
+    if (!host) {
+      console.warn(`[balcony-door] ⚠️ no host room found for "${balcony.name}" — skipping door.`);
+      continue;
+    }
+
+    const wall = findWallToHallway(balcony, host);
+    if (!wall) continue;
+
+    const doorWidth = 0.8;
+
+    // Only the host-room door is created — a single door on the interior room
+    // correctly shows the access point to the exterior extension.
+    const hostWall = oppositeWall(wall);
+    const hostWallLen = hostWall === "left" || hostWall === "right" ? host.height : host.width;
+    const hostOffset = Math.max(doorWidth / 2 + 0.15, Math.min(hostWallLen - doorWidth / 2 - 0.15, hostWallLen * 0.5));
+
+    doors.push({
+      room: host.name,
+      wall: hostWall,
+      offset: hostOffset,
       width: doorWidth,
       swing: "in",
-    };
-    console.log("[main-entrance] porch-side door on \"" + porch.name + "\" top wall, offset=" + porchDoor.offset.toFixed(2));
-    return [mainDoor, porchDoor];
+    });
+
+    console.log(`[balcony-door] "${host.name}" → "${balcony.name}" on ${hostWall} wall`);
   }
 
-  return [mainDoor];
+  return doors;
 }
