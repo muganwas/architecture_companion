@@ -20,6 +20,7 @@ export default function ReviewPage() {
   const [editing, setEditing] = useState(false);
   const [editedPrompt, setEditedPrompt] = useState("");
   const [isSketch, setIsSketch] = useState(false);
+  const [emergencyExit, setEmergencyExit] = useState(false);
 
   useEffect(() => {
     const raw = sessionStorage.getItem("archInput");
@@ -53,6 +54,8 @@ export default function ReviewPage() {
         description: editedPrompt.trim(),
         fileName: null,
         areaM2: analysis?.areaM2,
+        isGroundFloor: analysis?.isGroundFloor ?? true,
+        emergencyExit: emergencyExit,
       })
     );
     router.push("/processing");
@@ -229,6 +232,28 @@ export default function ReviewPage() {
             >
               ✎ Edit prompt to add more details
             </button>
+          )}
+
+          {/* Emergency exit option — only for apartments/upper-floor units */}
+          {analysis.isGroundFloor === false && (
+            <div className="bg-white rounded-xl border border-zinc-200/60 p-6">
+              <label className="flex items-center gap-3 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={emergencyExit}
+                  onChange={(e) => setEmergencyExit(e.target.checked)}
+                  className="w-5 h-5 rounded border-zinc-300 text-blue-600 focus:ring-blue-500"
+                />
+                <div>
+                  <span className="text-sm font-semibold text-zinc-800">
+                    Include mandatory emergency exit
+                  </span>
+                  <p className="text-xs text-zinc-500 mt-0.5">
+                    Required by building code in many countries for apartments and upper-floor units
+                  </p>
+                </div>
+              </label>
+            </div>
           )}
 
           {/* Actions */}

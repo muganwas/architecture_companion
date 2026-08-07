@@ -30,6 +30,9 @@ export default function ProcessingPage() {
       body: JSON.stringify({
         description: input.description || "A 2-bedroom modern apartment",
         areaM2: input.areaM2 || undefined,
+        isGroundFloor: input.isGroundFloor ?? true,
+        emergencyExit: input.emergencyExit ?? false,
+        kitchenLivingConnection: input.kitchenLivingConnection ?? "open",
       }),
     })
       .then(async (res) => {

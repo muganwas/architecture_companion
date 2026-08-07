@@ -34,6 +34,12 @@ interface GenerateFloorPlanInput {
   budget?: "basic" | "standard" | "premium";
   /** Pre-converted area in m², if the user specified one */
   areaM2?: number;
+  /** Whether this is a ground-floor house (true) or apartment/upper-floor (false) */
+  isGroundFloor?: boolean;
+  /** Whether to include a mandatory emergency exit (apartments only) */
+  emergencyExit?: boolean;
+  /** Kitchen-living room connection: "open" (default), "door", "window", or "separated" */
+  kitchenLivingConnection?: "open" | "door" | "window" | "separated";
 }
 
 export interface GeneratedRoom {
@@ -47,6 +53,8 @@ export interface GeneratedRoom {
   polygon?: Array<{ x: number; y: number }>;
   /** Shape type */
   shape?: "rectangle" | "l-shape" | "bay-window" | "angled-corner" | "polygon";
+  /** Optional display override (e.g., "I.Hallway" for apartment interior hallways) */
+  displayLabel?: string;
 }
 
 export interface Door {
@@ -85,6 +93,8 @@ export interface FloorPlanResult {
   placedFurniture?: PlacedFurniture[];
   /** Building perimeter polygon (world coords) */
   buildingPolygon?: Array<{ x: number; y: number }>;
+  /** For apartments: building corridor access point and the main entrance it connects to */
+  entranceApproach?: { eHallX: number; eHallY: number; doorX: number; doorY: number; wall: Door["wall"] };
   raw: string;
 }
 
@@ -173,8 +183,12 @@ export async function generateFloorPlan(
 
   // Try abstract plan format (layout engine), fall back to legacy coordinates
   if (parsed.zones && parsed.roomRatios) {
-    const layout = computeLayout(parsed as AbstractPlan);
-    const furniture = suggestFurniture(layout.rooms, layout.doors);
+    const layout = computeLayout(parsed as AbstractPlan, {
+      isGroundFloor: input.isGroundFloor ?? true,
+      emergencyExit: input.emergencyExit ?? false,
+      kitchenLivingConnection: input.kitchenLivingConnection ?? "open",
+    });
+    const furniture = suggestFurniture(layout.rooms, layout.doors, layout.windows);
 
     // Validate: check which requested rooms couldn't fit
     const warnings = validateRoomPlacement(input.description, parsed as AbstractPlan, layout.rooms);
@@ -188,6 +202,7 @@ export async function generateFloorPlan(
       costEstimate: parsed.costEstimate || { low: 50000, high: 80000, currency: "USD" },
       placedFurniture: furniture,
       buildingPolygon: layout.buildingPolygon,
+      entranceApproach: layout.entranceApproach,
       raw,
       warnings,
     };
@@ -196,7 +211,8 @@ export async function generateFloorPlan(
   // Legacy format
   const legacyRooms: GeneratedRoom[] = parsed.rooms || [];
   const legacyDoors: Door[] = parsed.doors || [];
-  const legacyFurniture = suggestFurniture(legacyRooms, legacyDoors);
+  const legacyWindows: Window[] = parsed.windows || [];
+  const legacyFurniture = suggestFurniture(legacyRooms, legacyDoors, legacyWindows);
   // Validate against user description
   const legacyWarnings = validateRoomPlacement(
     input.description,

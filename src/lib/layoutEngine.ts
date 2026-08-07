@@ -28,14 +28,27 @@ export interface LayoutResult {
   windows: Window[];
   /** Building perimeter polygon (world coords, meters) */
   buildingPolygon?: Array<{ x: number; y: number }>;
+  /** For apartments: building corridor access point and the main entrance it connects to */
+  entranceApproach?: { eHallX: number; eHallY: number; doorX: number; doorY: number; wall: Door["wall"] };
 }
 
 /* ------------------------------------------------------------------ */
 /*  Layout engine                                                      */
 /* ------------------------------------------------------------------ */
 
-export function computeLayout(plan: AbstractPlan): LayoutResult {
-  let { totalArea, hallwaySide, zones, roomRatios, exteriorExtensions } = plan;
+export interface LayoutOptions {
+  /** Whether this is a ground-floor house (true) or apartment/upper-floor (false).
+   *  Apartments get their main entrance from the hallway instead of an exterior wall. */
+  isGroundFloor?: boolean;
+  /** Whether to include a mandatory emergency exit (apartments only). */
+  emergencyExit?: boolean;
+  /** Kitchen-living room connection type. Default: "open" (wide passage). */
+  kitchenLivingConnection?: "open" | "door" | "window" | "separated";
+}
+
+export function computeLayout(plan: AbstractPlan, options?: LayoutOptions): LayoutResult {
+  let { totalArea } = plan;
+  const { hallwaySide, zones, roomRatios, exteriorExtensions } = plan;
 
   // Sanity: minimum total area is 60m², maximum 500m²
   if (totalArea < 60) {
@@ -69,10 +82,19 @@ export function computeLayout(plan: AbstractPlan): LayoutResult {
     }
   }
 
-  // Step 1: Place hallway between the two fixed-width columns
+  // Step 1: Place hallway between the two fixed-width columns.
+  // The hallway is an INTERIOR corridor — it must never be on an exterior wall,
+  // especially when balconies are present (balconies need exterior walls).
+  let effectiveHallwaySide = hallwaySide;
+  const hasBalconies = Object.keys(exteriorExtensions).some(k => /balcony/i.test(k));
+  if (hasBalconies && (effectiveHallwaySide === "left" || effectiveHallwaySide === "right")) {
+    console.log(`[hallway-balcony] forcing hallway from "${effectiveHallwaySide}" to "center" — balconies need exterior walls`);
+    effectiveHallwaySide = "center";
+  }
+
   let hallwayX: number;
-  if (hallwaySide === "left") hallwayX = polyBounds.x;
-  else if (hallwaySide === "right") hallwayX = polyBounds.x + colWidth * 2 + hallwayWidth - hallwayWidth;
+  if (effectiveHallwaySide === "left") hallwayX = polyBounds.x;
+  else if (effectiveHallwaySide === "right") hallwayX = polyBounds.x + colWidth * 2 + hallwayWidth - hallwayWidth;
   else hallwayX = polyBounds.x + colWidth; // center: between the two columns
 
   const hallway: GeneratedRoom = {
@@ -317,13 +339,28 @@ export function computeLayout(plan: AbstractPlan): LayoutResult {
     if (extRoom) rooms.push(extRoom);
   }
 
-  // Step 6: Generate main entrance first, then internal doors, balcony doors, then windows.
+  // Step 6: Generate all doors, then windows.
   // All doors must be known before windows so windows can avoid overlapping any door.
-  const mainEntranceDoors = generateMainEntrance(rooms);
-  const doors = generateDoors(rooms);
+  const isGroundFloor = options?.isGroundFloor ?? true;
+
+  // For apartments, mark the interior hallway to distinguish it from the
+  // building's shared exterior corridor / stairwell.
+  if (!isGroundFloor) {
+    hallway.displayLabel = "I.Hallway";
+  }
+  const mainEntranceDoors = generateMainEntrance(rooms, isGroundFloor);
+  // Track which room+wall combos already have a main entrance door
+  // so generateDoors doesn't create a duplicate hallway door on the same wall.
+  const mainEntranceWalls = new Set(mainEntranceDoors.map(d => `${d.room}:${d.wall}`));
+  const doors = generateDoors(rooms, mainEntranceWalls, options?.kitchenLivingConnection);
   for (const d of mainEntranceDoors) doors.push(d);
   const balconyDoors = generateBalconyDoors(rooms);
   for (const d of balconyDoors) doors.push(d);
+  // Emergency exit for apartments (if requested)
+  if (!isGroundFloor && options?.emergencyExit) {
+    const emergencyDoors = generateEmergencyExit(rooms);
+    for (const d of emergencyDoors) doors.push(d);
+  }
   const windows = generateWindows(rooms, buildingW, buildingH, doors);
 
   // Step 7: Apply creative shapes post-processing (interior shapes only)
@@ -345,7 +382,9 @@ export function computeLayout(plan: AbstractPlan): LayoutResult {
     { x: extents.minX, y: extents.maxY },
   ];
 
-  return { rooms, doors, windows, buildingPolygon: buildingPoly };
+  return { rooms, doors, windows, buildingPolygon: buildingPoly,
+    entranceApproach: computeEntranceApproach(rooms, mainEntranceDoors, isGroundFloor),
+  };
 }
 
 /* ------------------------------------------------------------------ */
@@ -1294,7 +1333,7 @@ function createExtension(
   }
 }
 
-function generateDoors(rooms: GeneratedRoom[]): Door[] {
+function generateDoors(rooms: GeneratedRoom[], skipWalls?: Set<string>, kitchenLivingConnection?: "open" | "door" | "window" | "separated"): Door[] {
   const doors: Door[] = [];
   const hallway = rooms.find(r => /hallway/i.test(r.name));
   const kitchen = rooms.find(r => /kitchen/i.test(r.name));
@@ -1409,6 +1448,10 @@ function generateDoors(rooms: GeneratedRoom[]): Door[] {
     if (hallway) {
       const wall = findWallToHallway(room, hallway);
       if (wall) {
+        // Skip if a main entrance door already exists on this room+wall (apartment mode)
+        const key = `${room.name}:${wall}`;
+        if (skipWalls && skipWalls.has(key)) continue;
+
         const wallLen = wall === "left" || wall === "right" ? room.height : room.width;
         doors.push({
           room: room.name,
@@ -1417,6 +1460,59 @@ function generateDoors(rooms: GeneratedRoom[]): Door[] {
           width: 0.85,
           swing: "in",
         });
+      }
+    }
+  }
+
+  // ── Kitchen ↔ living room connection ──
+  // Default: wide open-plan passage. Can be overridden to door, window, or solid wall.
+  const klConnection = kitchenLivingConnection ?? "open";
+  if (klConnection !== "separated" && kitchen && hallway) {
+    const livingRoom = rooms.find(r => /living|lounge|family/i.test(r.name));
+    if (livingRoom && livingRoom !== kitchen) {
+      const sharedWall = findWallToHallway(kitchen, livingRoom);
+      if (sharedWall) {
+        const wallLen = sharedWall === "left" || sharedWall === "right"
+          ? kitchen.height : kitchen.width;
+
+        let openingWidth: number;
+        let label: string;
+        switch (klConnection) {
+          case "door":
+            openingWidth = 0.85;
+            label = "door";
+            break;
+          case "window":
+            openingWidth = Math.min(wallLen * 0.3, 1.5);
+            label = "serving window";
+            break;
+          default: // "open"
+            openingWidth = Math.min(wallLen * 0.6, 2.5);
+            label = "open passage";
+            break;
+        }
+
+        const openingOffset = wallLen * 0.5;
+
+        // Opening on the kitchen side
+        doors.push({
+          room: kitchen.name,
+          wall: sharedWall,
+          offset: openingOffset,
+          width: openingWidth,
+          swing: "in",
+        });
+        // Matching opening on the living room side
+        doors.push({
+          room: livingRoom.name,
+          wall: oppositeWall(sharedWall),
+          offset: (oppositeWall(sharedWall) === "left" || oppositeWall(sharedWall) === "right"
+            ? livingRoom.height : livingRoom.width) * 0.5,
+          width: openingWidth,
+          swing: "in",
+        });
+
+        console.log(`[kitchen-living] ${label} (${openingWidth.toFixed(1)}m) on ${sharedWall} wall`);
       }
     }
   }
@@ -1519,7 +1615,7 @@ function generateWindows(rooms: GeneratedRoom[], buildingW: number, buildingH: n
       const best = freeSegments[0];
       const availableLen = best.end - best.start;
 
-      let wWidth = Math.min(availableLen * 0.7, 1.8);
+      const wWidth = Math.min(availableLen * 0.7, 1.8);
       if (wWidth < 0.4) continue;
 
       // Center the window in the available gap
@@ -1550,14 +1646,71 @@ function generateWindows(rooms: GeneratedRoom[], buildingW: number, buildingH: n
 }
 
 /**
- * Generate the main entrance door on the front of the house.
- * Priority: living room on front → hallway → any front room.
- * If a porch exists, the door connects to it.
+ * Generate the main entrance door.
+ * Ground-floor houses: front exterior wall (bottom), optionally via porch.
+ * Apartments/upper-floor: exterior bottom wall, aligned with E.Hallway
+ *   (the building's shared corridor / stairwell access point).
  */
-function generateMainEntrance(rooms: GeneratedRoom[]): Door[] {
+function generateMainEntrance(rooms: GeneratedRoom[], isGroundFloor: boolean = true): Door[] {
   const TOL = 0.1;
   const porch = rooms.find(r => /porch/i.test(r.name));
+  const hallway = rooms.find(r => /hallway/i.test(r.name));
+  const doorWidth = 1.0;
 
+  // ── Apartment/upper-floor: exterior wall WITHOUT a balcony ──
+  // E.Hallway (building corridor) and balconies serve different purposes
+  // and must not occupy the same exterior side of the building.
+  if (!isGroundFloor && hallway) {
+    const balconySides = getBalconySides(rooms);
+    const TOL = 0.1;
+
+    // Compute building extents from rooms
+    let bldMaxX = 0, bldMaxY = 0;
+    for (const r of rooms) {
+      if (/porch|balcony/i.test(r.name)) continue;
+      if (r.x + r.width > bldMaxX) bldMaxX = r.x + r.width;
+      if (r.y + r.height > bldMaxY) bldMaxY = r.y + r.height;
+    }
+
+    // Find a room on an exterior wall that doesn't have a balcony
+    // Priority: bottom (front) → left → right → top
+    const candidateWalls: Array<{ wall: Door["wall"]; check: (r: GeneratedRoom) => boolean; label: string }> = [
+      { wall: "bottom", check: r => Math.abs(r.y) < TOL, label: "bottom (front)" },
+      { wall: "left",   check: r => Math.abs(r.x) < TOL, label: "left" },
+      { wall: "right",  check: r => Math.abs(r.x + r.width - bldMaxX) < TOL, label: "right" },
+      { wall: "top",    check: r => Math.abs(r.y + r.height - bldMaxY) < TOL, label: "top (back)" },
+    ];
+
+    for (const { wall, check, label } of candidateWalls) {
+      if (balconySides.has(wall)) {
+        console.log(`[main-entrance] skipping ${label} wall — has balcony`);
+        continue;
+      }
+
+      const room = rooms.find(r =>
+        check(r) && !/hallway|porch|balcony|garage/i.test(r.name)
+      );
+
+      if (room) {
+        const wallLen = wall === "left" || wall === "right" ? room.height : room.width;
+        const offset = Math.max(doorWidth / 2 + 0.2, Math.min(wallLen - doorWidth / 2 - 0.2, wallLen * 0.5));
+
+        console.log(`[main-entrance] apartment: exterior ${label} wall of "${room.name}" (E.Hallway access)`);
+        return [{
+          room: room.name,
+          wall,
+          offset,
+          width: doorWidth,
+          swing: "in",
+        }];
+      }
+    }
+
+    console.warn("[main-entrance] ⚠️ apartment mode but no non-balcony exterior wall for main entrance.");
+    return [];
+  }
+
+  // ── Ground-floor: front exterior door ──
   // Find rooms touching the front (y ≈ 0)
   const frontRooms = rooms.filter(r =>
     !/porch|balcony/i.test(r.name) && Math.abs(r.y) < TOL
@@ -1570,7 +1723,6 @@ function generateMainEntrance(rooms: GeneratedRoom[]): Door[] {
 
   if (!frontRoom) return [];
 
-  const doorWidth = 1.0;
   // World-x center of the door: align with porch center if present, else room center
   const doorWorldX = porch
     ? porch.x + porch.width / 2
@@ -1620,7 +1772,7 @@ function generateBalconyDoors(rooms: GeneratedRoom[]): Door[] {
     const wall = findWallToHallway(balcony, host);
     if (!wall) continue;
 
-    const doorWidth = 0.8;
+    const doorWidth = 2.0; // wide sliding/French door for balcony access
 
     // Only the host-room door is created — a single door on the interior room
     // correctly shows the access point to the exterior extension.
@@ -1640,4 +1792,128 @@ function generateBalconyDoors(rooms: GeneratedRoom[]): Door[] {
   }
 
   return doors;
+}
+
+/**
+ * Generate a mandatory emergency exit for apartments/upper-floor units.
+ * Placed on an exterior wall of a room that doesn't already have a balcony door.
+ * Priority: master bedroom → kitchen → any bedroom → living room.
+ * Swings outward for safety compliance.
+ */
+function generateEmergencyExit(rooms: GeneratedRoom[]): Door[] {
+  const hallway = rooms.find(r => /hallway/i.test(r.name));
+
+  // Find rooms with an exterior wall, excluding hallway, porch, balcony, garage
+  const candidates = rooms.filter(r =>
+    !/hallway|porch|balcony|garage|ensuite|bathroom|laundry/i.test(r.name)
+  );
+
+  // Sort by priority: master → kitchen → bedroom → living → any
+  const priority = (r: GeneratedRoom): number => {
+    const n = r.name.toLowerCase();
+    if (/master/i.test(n)) return 0;
+    if (/kitchen/i.test(n)) return 1;
+    if (/bedroom/i.test(n)) return 2;
+    if (/living|lounge|family/i.test(n)) return 3;
+    return 4;
+  };
+  candidates.sort((a, b) => priority(a) - priority(b));
+
+  for (const room of candidates) {
+    // Find an exterior wall that's NOT the hallway wall
+    const extWall = findExteriorWall(room, rooms);
+    if (!extWall) continue;
+
+    // Skip if this wall faces the hallway
+    if (hallway) {
+      const hallwayWall = findWallToHallway(room, hallway);
+      if (hallwayWall === extWall) continue;
+    }
+
+    const wallLen = extWall === "left" || extWall === "right" ? room.height : room.width;
+    const doorWidth = 0.9;
+
+    // Place near the edge of the wall, away from the center (doesn't compete with windows)
+    const offset = Math.max(doorWidth / 2 + 0.2, wallLen * 0.15);
+
+    console.log(`[emergency-exit] on "${room.name}" ${extWall} wall`);
+    return [{
+      room: room.name,
+      wall: extWall,
+      offset,
+      width: doorWidth,
+      swing: "out", // emergency exits swing outward
+    }];
+  }
+
+  console.warn("[emergency-exit] ⚠️ no suitable exterior wall found for emergency exit.");
+  return [];
+}
+
+/**
+ * For apartments, compute the E.Hallway position outside the building.
+ * E.Hallway is the building's shared corridor — placed on an exterior side
+ * that does NOT have a balcony (balconies face open space, not corridors).
+ */
+function computeEntranceApproach(
+  rooms: GeneratedRoom[],
+  mainEntranceDoors: Door[],
+  isGroundFloor: boolean
+): { eHallX: number; eHallY: number; doorX: number; doorY: number; wall: Door["wall"] } | undefined {
+  if (isGroundFloor) return undefined;
+
+  const mainDoor = mainEntranceDoors[0];
+  if (!mainDoor) return undefined;
+
+  const room = rooms.find(r => r.name === mainDoor.room);
+  if (!room) return undefined;
+
+  const wall = mainDoor.wall;
+
+  // Compute door world position
+  let doorWorldX: number, doorWorldY: number;
+  if (wall === "left" || wall === "right") {
+    doorWorldX = wall === "left" ? room.x : room.x + room.width;
+    doorWorldY = room.y + mainDoor.offset;
+  } else {
+    doorWorldX = room.x + mainDoor.offset;
+    doorWorldY = wall === "bottom" ? room.y : room.y + room.height;
+  }
+
+  // E.Hallway: outside the building, on the same side as the main entrance door
+  const eHallDist = 1.0;
+  let eHallX = doorWorldX, eHallY = doorWorldY;
+  switch (wall) {
+    case "bottom": eHallY = room.y - eHallDist; break;
+    case "top":    eHallY = room.y + room.height + eHallDist; break;
+    case "left":   eHallX = room.x - eHallDist; break;
+    case "right":  eHallX = room.x + room.width + eHallDist; break;
+  }
+
+  return { eHallX, eHallY, doorX: doorWorldX, doorY: doorWorldY, wall };
+}
+
+/** Detect which building exterior sides have balconies attached. */
+function getBalconySides(rooms: GeneratedRoom[]): Set<"top" | "bottom" | "left" | "right"> {
+  const sides = new Set<"top" | "bottom" | "left" | "right">();
+  const TOL = 0.2;
+
+  // Compute building extents
+  let maxX = 0, maxY = 0, minX = Infinity, minY = Infinity;
+  for (const r of rooms) {
+    if (/porch|balcony/i.test(r.name)) continue;
+    if (r.x < minX) minX = r.x;
+    if (r.y < minY) minY = r.y;
+    if (r.x + r.width > maxX) maxX = r.x + r.width;
+    if (r.y + r.height > maxY) maxY = r.y + r.height;
+  }
+
+  for (const r of rooms) {
+    if (!/balcony/i.test(r.name)) continue;
+    if (r.y + r.height <= minY + TOL) sides.add("bottom");
+    if (r.y >= maxY - TOL) sides.add("top");
+    if (r.x + r.width <= minX + TOL) sides.add("left");
+    if (r.x >= maxX - TOL) sides.add("right");
+  }
+  return sides;
 }

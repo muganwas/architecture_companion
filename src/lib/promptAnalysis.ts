@@ -7,6 +7,8 @@ export interface PromptAnalysis {
   areaM2?: number;
   /** Original area string the user provided */
   areaOriginal?: string;
+  /** Whether this is a ground-floor house (true) or apartment/upper-floor (false) */
+  isGroundFloor?: boolean;
 }
 
 export function analyzePrompt(description: string): PromptAnalysis {
@@ -48,6 +50,15 @@ export function analyzePrompt(description: string): PromptAnalysis {
   } else {
     missing.push("House type (bungalow, apartment, etc.)");
     defaults.push({ label: "House type", value: "Single-story (default)" });
+  }
+
+  // 2b. Detect if this is an apartment/condo/upper-floor (not ground floor)
+  const isGroundFloor = !(
+    /apartment|condo|condominium|flat\b|upper\s*floor|(?<!\w)floor\s*\d/i.test(desc) ||
+    /\b(2nd|3rd|4th|5th|6th|7th|8th|9th|10th|second|third|fourth|fifth)\s*floor/i.test(desc)
+  );
+  if (!isGroundFloor) {
+    found.push("Apartment / upper-floor unit");
   }
 
   // 3. Total area / size — convert to m²
@@ -135,5 +146,5 @@ export function analyzePrompt(description: string): PromptAnalysis {
 
   const summary = summaryParts.join(", ");
 
-  return { found, missing, defaults, summary, areaM2, areaOriginal };
+  return { found, missing, defaults, summary, areaM2, areaOriginal, isGroundFloor };
 }

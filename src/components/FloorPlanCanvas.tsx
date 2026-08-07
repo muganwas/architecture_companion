@@ -15,6 +15,8 @@ interface FloorPlanCanvasProps {
   windows: Window[];
   placedFurniture?: PlacedFurniture[];
   buildingPolygon?: Array<{ x: number; y: number }>;
+  /** For apartments: where the building corridor/stairwell connects */
+  entranceApproach?: { eHallX: number; eHallY: number; doorX: number; doorY: number; wall: Door["wall"] };
   viewMode: "2d" | "3d";
   onRoomHover?: (room: GeneratedRoom | null) => void;
   onFurnitureHover?: (info: { name: string; room: string } | null) => void;
@@ -44,6 +46,8 @@ function fill(n: string) {
 
 interface BBox { x: number; y: number; w: number; h: number; }
 
+const BBOX_MARGIN = 1.5; // extra world-space margin so exterior labels aren't cut off
+
 function computeBBox(rooms: GeneratedRoom[], poly?: Array<{ x: number; y: number }>): BBox {
   let x1 = Infinity, y1 = Infinity, x2 = -Infinity, y2 = -Infinity;
   for (const r of rooms) {
@@ -58,6 +62,9 @@ function computeBBox(rooms: GeneratedRoom[], poly?: Array<{ x: number; y: number
       if (p.x > x2) x2 = p.x; if (p.y > y2) y2 = p.y;
     }
   }
+  // Add margin so exterior markers (E.Hallway, porch/balcony labels) aren't clipped
+  x1 -= BBOX_MARGIN; y1 -= BBOX_MARGIN;
+  x2 += BBOX_MARGIN; y2 += BBOX_MARGIN;
   return { x: x1, y: y1, w: x2 - x1 || 10, h: y2 - y1 || 10 };
 }
 
@@ -314,7 +321,7 @@ function rectToScreenFlat(room: GeneratedRoom, s: number, bb: BBox): number[] {
 /* ------------------------------------------------------------------ */
 
 export default function FloorPlanCanvas({
-  rooms, doors, windows, placedFurniture, buildingPolygon, viewMode, onRoomHover, onFurnitureHover,
+  rooms, doors, windows, placedFurniture, buildingPolygon, entranceApproach, viewMode, onRoomHover, onFurnitureHover,
 }: FloorPlanCanvasProps) {
   const [hoveredKey, setHoveredKey] = useState<string | null>(null);
   const [hoveredFurnIdx, setHoveredFurnIdx] = useState<number | null>(null);
@@ -344,8 +351,6 @@ export default function FloorPlanCanvas({
     }
     return map;
   }, [placedFurniture]);
-
-  if (rooms.length === 0) return null;
 
   /* ================================================================ */
   /*  GRID LINES                                                       */
@@ -522,23 +527,47 @@ export default function FloorPlanCanvas({
         )}
 
         {/* ============ BED (top-down) ============ */}
-        {(pf.itemId === "bed-single" || pf.itemId === "bed-double" || pf.itemId === "bed-queen" || pf.itemId === "bed-king") && (
+        {(pf.itemId === "bed-single" || pf.itemId === "bed-double" || pf.itemId === "bed-queen" || pf.itemId === "bed-king") && (() => {
+          // Headboard is always on the shorter side (item.width < item.height for all beds)
+          // After rotation: rw = rendered width, rh = rendered height
+          const isRotatedHead = rw > rh; // headboard should be on the shorter dimension
+          const hbW = isRotatedHead ? rh : rw;
+          const hbH = isRotatedHead ? rw : rh;
+          return (
           <>
-            {/* Headboard — thin edge against the wall */}
-            <Rect x={0} y={0} width={rw} height={rh * 0.04} fill={strokeC} stroke={strokeC} strokeWidth={sw} />
+            {/* Headboard — thin edge spanning the shorter side */}
+            {isRotatedHead ? (
+              <Rect x={0} y={0} width={hbH * 0.04} height={hbW} fill={strokeC} stroke={strokeC} strokeWidth={sw} />
+            ) : (
+              <Rect x={0} y={0} width={hbW} height={hbH * 0.04} fill={strokeC} stroke={strokeC} strokeWidth={sw} />
+            )}
             {/* Mattress — main rectangle */}
-            <Rect x={rw * 0.03} y={rh * 0.04} width={rw * 0.94} height={rh * 0.88} fill={fillC} stroke={strokeC} strokeWidth={sw} cornerRadius={5} />
+            {isRotatedHead ? (
+              <Rect x={hbH * 0.04} y={hbW * 0.03} width={hbH * 0.88} height={hbW * 0.94} fill={fillC} stroke={strokeC} strokeWidth={sw} cornerRadius={5} />
+            ) : (
+              <Rect x={hbW * 0.03} y={hbH * 0.04} width={hbW * 0.94} height={hbH * 0.88} fill={fillC} stroke={strokeC} strokeWidth={sw} cornerRadius={5} />
+            )}
             {/* Two pillows at the head end */}
-            <Rect x={rw * 0.08} y={rh * 0.08} width={rw * 0.36} height={rh * 0.14} fill="#FFFFFF" stroke={strokeC} strokeWidth={0.6} cornerRadius={5} />
-            <Rect x={rw * 0.56} y={rh * 0.08} width={rw * 0.36} height={rh * 0.14} fill="#FFFFFF" stroke={strokeC} strokeWidth={0.6} cornerRadius={5} />
+            {isRotatedHead ? (
+              <>
+                <Rect x={hbH * 0.08} y={hbW * 0.08} width={hbH * 0.14} height={hbW * 0.36} fill="#FFFFFF" stroke={strokeC} strokeWidth={0.6} cornerRadius={5} />
+                <Rect x={hbH * 0.08} y={hbW * 0.56} width={hbH * 0.14} height={hbW * 0.36} fill="#FFFFFF" stroke={strokeC} strokeWidth={0.6} cornerRadius={5} />
+              </>
+            ) : (
+              <>
+                <Rect x={hbW * 0.08} y={hbH * 0.08} width={hbW * 0.36} height={hbH * 0.14} fill="#FFFFFF" stroke={strokeC} strokeWidth={0.6} cornerRadius={5} />
+                <Rect x={hbW * 0.56} y={hbH * 0.08} width={hbW * 0.36} height={hbH * 0.14} fill="#FFFFFF" stroke={strokeC} strokeWidth={0.6} cornerRadius={5} />
+              </>
+            )}
             {/* Duvet fold line ~⅔ down the bed */}
-            <Line points={[rw * 0.08, rh * 0.62, rw * 0.92, rh * 0.62]} stroke={strokeC} strokeWidth={0.7} opacity={0.3} />
-            {/* Duvet texture — subtle cross-hatch */}
-            <Line points={[rw * 0.15, rh * 0.7, rw * 0.15, rh * 0.88]} stroke={strokeC} strokeWidth={0.4} opacity={0.15} />
-            <Line points={[rw * 0.5, rh * 0.7, rw * 0.5, rh * 0.88]} stroke={strokeC} strokeWidth={0.4} opacity={0.15} />
-            <Line points={[rw * 0.85, rh * 0.7, rw * 0.85, rh * 0.88]} stroke={strokeC} strokeWidth={0.4} opacity={0.15} />
+            {isRotatedHead ? (
+              <Line points={[hbH * 0.62, hbW * 0.08, hbH * 0.62, hbW * 0.92]} stroke={strokeC} strokeWidth={0.7} opacity={0.3} />
+            ) : (
+              <Line points={[hbW * 0.08, hbH * 0.62, hbW * 0.92, hbH * 0.62]} stroke={strokeC} strokeWidth={0.7} opacity={0.3} />
+            )}
           </>
-        )}
+          );
+        })()}
 
         {/* ============ TOILET (top-down) ============ */}
         {pf.itemId === "toilet" && (
@@ -602,35 +631,109 @@ export default function FloorPlanCanvas({
           </>
         )}
 
-        {/* ============ KITCHEN COUNTER (top-down) ============ */}
-        {(pf.itemId === "kitchen-counter-straight" || pf.itemId === "kitchen-counter-corner") && !pf.itemId.includes("island") && (
+        {/* ============ KITCHEN COUNTER with built-in stove + sink ============ */}
+        {(pf.itemId === "kitchen-counter-straight" || pf.itemId === "kitchen-counter-small") && !pf.itemId.includes("island") && (() => {
+          // Counter is long-and-thin: stove + sink sit side-by-side along the LONG edge.
+          // Horizontal (rw >= rh): stove left, sink right, spanning the depth (rh).
+          // Vertical (rw < rh):   stove top, sink bottom, spanning the depth (rw).
+          const isVert = rw < rh;
+          return (
           <>
-            {/* Worktop surface */}
+            {/* Main worktop surface */}
             <Rect x={0} y={0} width={rw} height={rh} fill={fillC} stroke={strokeC} strokeWidth={sw} cornerRadius={3} />
-            {/* Front edge highlight (overhang) */}
+            {/* Stove — with hover */}
+            <Group
+              onMouseEnter={(e) => { e.cancelBubble = true; onFurnitureHover?.({ name: "4-Burner Stove", room: pf.room }); }}
+              onMouseLeave={() => onFurnitureHover?.(null)}
+            >
+              {isVert ? (
+                <>
+                  <Rect x={rw * 0.1} y={rh * 0.04} width={rw * 0.8} height={rh * 0.38} fill="#2A2A2A" stroke="#555" strokeWidth={1} cornerRadius={3} />
+                  {[[0.2, 0.2], [0.8, 0.2], [0.2, 0.8], [0.8, 0.8]].map(([bx, by], bi) => (
+                    <Group key={`cv-${bi}`}>
+                      <Circle x={rw * (0.1 + 0.8 * bx)} y={rh * (0.04 + 0.38 * by)} radius={rw * 0.065} fill="#444" stroke="#777" strokeWidth={0.7} />
+                      <Circle x={rw * (0.1 + 0.8 * bx)} y={rh * (0.04 + 0.38 * by)} radius={rw * 0.028} fill="#666" />
+                      <Line points={[rw * (0.1 + 0.8 * bx - 0.05), rh * (0.04 + 0.38 * by), rw * (0.1 + 0.8 * bx + 0.05), rh * (0.04 + 0.38 * by)]} stroke="#666" strokeWidth={0.4} />
+                      <Line points={[rw * (0.1 + 0.8 * bx), rh * (0.04 + 0.38 * by - 0.05), rw * (0.1 + 0.8 * bx), rh * (0.04 + 0.38 * by + 0.05)]} stroke="#666" strokeWidth={0.4} />
+                    </Group>
+                  ))}
+                </>
+              ) : (
+                <>
+                  <Rect x={rw * 0.04} y={rh * 0.08} width={rw * 0.38} height={rh * 0.84} fill="#2A2A2A" stroke="#555" strokeWidth={1} cornerRadius={3} />
+                  {[[0.2, 0.2], [0.8, 0.2], [0.2, 0.8], [0.8, 0.8]].map(([bx, by], bi) => (
+                    <Group key={`ch-${bi}`}>
+                      <Circle x={rw * (0.04 + 0.38 * bx)} y={rh * (0.08 + 0.84 * by)} radius={rw * 0.055} fill="#444" stroke="#777" strokeWidth={0.7} />
+                      <Circle x={rw * (0.04 + 0.38 * bx)} y={rh * (0.08 + 0.84 * by)} radius={rw * 0.022} fill="#666" />
+                      <Line points={[rw * (0.04 + 0.38 * bx - 0.04), rh * (0.08 + 0.84 * by), rw * (0.04 + 0.38 * bx + 0.04), rh * (0.08 + 0.84 * by)]} stroke="#666" strokeWidth={0.4} />
+                      <Line points={[rw * (0.04 + 0.38 * bx), rh * (0.08 + 0.84 * by - 0.04), rw * (0.04 + 0.38 * bx), rh * (0.08 + 0.84 * by + 0.04)]} stroke="#666" strokeWidth={0.4} />
+                    </Group>
+                  ))}
+                </>
+              )}
+            </Group>
+            {/* Sink — with hover */}
+            <Group
+              onMouseEnter={(e) => { e.cancelBubble = true; onFurnitureHover?.({ name: "Kitchen Sink", room: pf.room }); }}
+              onMouseLeave={() => onFurnitureHover?.(null)}
+            >
+              {isVert ? (
+                <>
+                  <Rect x={rw * 0.1} y={rh * 0.58} width={rw * 0.8} height={rh * 0.34} fill="#C0C8D0" stroke="#999" strokeWidth={0.8} cornerRadius={4} />
+                  <Rect x={rw * 0.13} y={rh * 0.62} width={rw * 0.74} height={rh * 0.26} fill="#A8B4BC" stroke="#888" strokeWidth={0.4} cornerRadius={2} />
+                  <Circle x={rw * 0.5} y={rh * 0.72} radius={rw * 0.04} fill="#777" />
+                  <Circle x={rw * 0.85} y={rh * 0.56} radius={rw * 0.03} fill={strokeC} />
+                </>
+              ) : (
+                <>
+                  <Rect x={rw * 0.58} y={rh * 0.1} width={rw * 0.38} height={rh * 0.8} fill="#C0C8D0" stroke="#999" strokeWidth={0.8} cornerRadius={4} />
+                  <Rect x={rw * 0.61} y={rh * 0.14} width={rw * 0.32} height={rh * 0.72} fill="#A8B4BC" stroke="#888" strokeWidth={0.4} cornerRadius={2} />
+                  <Circle x={rw * 0.8} y={rh * 0.55} radius={rw * 0.035} fill="#777" />
+                  <Circle x={rw * 0.78} y={rh * 0.08} radius={rw * 0.03} fill={strokeC} />
+                  <Rect x={rw * 0.775} y={0} width={rw * 0.01} height={rh * 0.08} fill={strokeC} />
+                </>
+              )}
+            </Group>
+            {/* Counter edge highlight */}
             <Line points={[0, rh, rw, rh]} stroke={strokeC} strokeWidth={1.5} opacity={0.5} />
-            {/* Subtle cabinet divisions below (dashed lines on surface) */}
-            <Line points={[rw * 0.33, rh * 0.2, rw * 0.33, rh * 0.8]} stroke={strokeC} strokeWidth={0.5} opacity={0.2} dash={[2, 3]} />
-            <Line points={[rw * 0.66, rh * 0.2, rw * 0.66, rh * 0.8]} stroke={strokeC} strokeWidth={0.5} opacity={0.2} dash={[2, 3]} />
           </>
-        )}
+          );
+        })()}
 
-        {/* ============ STOVE / OVEN (top-down) ============ */}
-        {pf.itemId === "stove-4-burner" && (
+        {/* ============ KITCHEN ISLAND with built-in stove + sink ============ */}
+        {pf.itemId === "kitchen-island" && (
           <>
-            {/* Stove body */}
-            <Rect x={0} y={0} width={rw} height={rh} fill="#3A3A3A" stroke={strokeC} strokeWidth={sw} cornerRadius={3} />
-            {/* Cooktop surface */}
-            <Rect x={rw * 0.05} y={rh * 0.05} width={rw * 0.9} height={rh * 0.9} fill="#2A2A2A" stroke="#555" strokeWidth={0.8} cornerRadius={2} />
-            {/* 4 burners — circles with cross marks */}
-            {[[0.25, 0.25], [0.75, 0.25], [0.25, 0.75], [0.75, 0.75]].map(([bx, by], bi) => (
-              <Group key={`burner-${bi}`}>
-                <Circle x={rw * bx} y={rh * by} radius={rw * 0.1} fill="#444" stroke="#666" strokeWidth={0.5} />
-                <Circle x={rw * bx} y={rh * by} radius={rw * 0.04} fill="#555" />
-                <Line points={[rw * (bx - 0.08), rh * by, rw * (bx + 0.08), rh * by]} stroke="#555" strokeWidth={0.3} />
-                <Line points={[rw * bx, rh * (by - 0.08), rw * bx, rh * (by + 0.08)]} stroke="#555" strokeWidth={0.3} />
-              </Group>
-            ))}
+            {/* Main worktop */}
+            <Rect x={0} y={0} width={rw} height={rh} fill={fillC} stroke={strokeC} strokeWidth={sw} cornerRadius={4} />
+            {/* Stove — embedded with hover */}
+            <Group
+              onMouseEnter={(e) => { e.cancelBubble = true; onFurnitureHover?.({ name: "4-Burner Stove", room: pf.room }); }}
+              onMouseLeave={() => onFurnitureHover?.(null)}
+            >
+              <Rect x={rw * 0.06} y={rh * 0.1} width={rw * 0.32} height={rh * 0.38} fill="#2A2A2A" stroke="#555" strokeWidth={0.8} cornerRadius={3} />
+              {[[0.2, 0.2], [0.8, 0.2], [0.2, 0.8], [0.8, 0.8]].map(([bx, by], bi) => (
+                <Group key={`ib-${bi}`}>
+                  <Circle x={rw * (0.06 + 0.32 * bx)} y={rh * (0.1 + 0.38 * by)} radius={rw * 0.05} fill="#444" stroke="#777" strokeWidth={0.6} />
+                  <Circle x={rw * (0.06 + 0.32 * bx)} y={rh * (0.1 + 0.38 * by)} radius={rw * 0.02} fill="#666" />
+                </Group>
+              ))}
+            </Group>
+            {/* Sink — embedded with hover */}
+            <Group
+              onMouseEnter={(e) => { e.cancelBubble = true; onFurnitureHover?.({ name: "Kitchen Sink", room: pf.room }); }}
+              onMouseLeave={() => onFurnitureHover?.(null)}
+            >
+              <Rect x={rw * 0.62} y={rh * 0.12} width={rw * 0.26} height={rh * 0.35} fill="#C0C8D0" stroke="#999" strokeWidth={0.7} cornerRadius={4} />
+              <Rect x={rw * 0.65} y={rh * 0.16} width={rw * 0.2} height={rh * 0.27} fill="#A8B4BC" stroke="#888" strokeWidth={0.3} cornerRadius={2} />
+              <Circle x={rw * 0.77} y={rh * 0.34} radius={rw * 0.025} fill="#777" />
+              <Circle x={rw * 0.74} y={rh * 0.1} radius={rw * 0.025} fill={strokeC} />
+            </Group>
+            {/* Overhang on bottom side (seating) */}
+            <Rect x={0} y={rh * 0.6} width={rw} height={rh * 0.4} fill={fillC} stroke={strokeC} strokeWidth={sw / 2} cornerRadius={[0, 0, 3, 3]} opacity={0.6} />
+            {/* Stool indicators */}
+            <Rect x={rw * 0.12} y={rh * 0.68} width={rw * 0.16} height={rh * 0.2} fill={strokeC} cornerRadius={3} opacity={0.3} />
+            <Rect x={rw * 0.42} y={rh * 0.68} width={rw * 0.16} height={rh * 0.2} fill={strokeC} cornerRadius={3} opacity={0.3} />
+            <Rect x={rw * 0.72} y={rh * 0.68} width={rw * 0.16} height={rh * 0.2} fill={strokeC} cornerRadius={3} opacity={0.3} />
           </>
         )}
 
@@ -644,34 +747,6 @@ export default function FloorPlanCanvas({
             <Line points={[rw * 0.1, rh * 0.05, rw * 0.1, rh * 0.95]} stroke="#BBB" strokeWidth={0.4} opacity={0.3} />
             <Line points={[rw * 0.3, rh * 0.05, rw * 0.3, rh * 0.95]} stroke="#BBB" strokeWidth={0.4} opacity={0.3} />
             <Line points={[rw * 0.5, rh * 0.05, rw * 0.5, rh * 0.95]} stroke="#BBB" strokeWidth={0.4} opacity={0.3} />
-          </>
-        )}
-
-        {/* ============ KITCHEN SINK (top-down) ============ */}
-        {pf.itemId === "kitchen-sink" && (
-          <>
-            {/* Sink rim — sits in counter cutout */}
-            <Rect x={0} y={0} width={rw} height={rh} fill="#D0D0D0" stroke={strokeC} strokeWidth={sw} cornerRadius={4} />
-            {/* Basin depression */}
-            <Rect x={rw * 0.08} y={rh * 0.08} width={rw * 0.84} height={rh * 0.84} fill="#B8C0C8" stroke="#999" strokeWidth={0.6} cornerRadius={3} />
-            {/* Drain */}
-            <Circle x={rw * 0.65} y={rh * 0.7} radius={rw * 0.06} fill="#888" />
-            {/* Faucet base */}
-            <Circle x={rw / 2} y={0} radius={rw * 0.07} fill={strokeC} />
-          </>
-        )}
-
-        {/* ============ KITCHEN ISLAND (top-down) ============ */}
-        {pf.itemId === "kitchen-island" && (
-          <>
-            {/* Main worktop */}
-            <Rect x={0} y={0} width={rw} height={rh} fill={fillC} stroke={strokeC} strokeWidth={sw} cornerRadius={4} />
-            {/* Overhang on one long side (seating side) */}
-            <Rect x={0} y={rh * 0.12} width={rw} height={rh * 0.88} fill={fillC} stroke={strokeC} strokeWidth={sw / 2} cornerRadius={[0, 0, 3, 3]} opacity={0.6} />
-            {/* Stool indicators — small rectangles along overhang edge */}
-            <Rect x={rw * 0.12} y={rh * 0.18} width={rw * 0.16} height={rh * 0.2} fill={strokeC} cornerRadius={3} opacity={0.3} />
-            <Rect x={rw * 0.42} y={rh * 0.18} width={rw * 0.16} height={rh * 0.2} fill={strokeC} cornerRadius={3} opacity={0.3} />
-            <Rect x={rw * 0.72} y={rh * 0.18} width={rw * 0.16} height={rh * 0.2} fill={strokeC} cornerRadius={3} opacity={0.3} />
           </>
         )}
 
@@ -787,6 +862,8 @@ export default function FloorPlanCanvas({
     );
   }, [s, bb, hoveredFurnIdx, onFurnitureHover]);
 
+  if (rooms.length === 0) return null;
+
   return (
     <div className="relative w-full aspect-square max-w-[700px] mx-auto
                     bg-[#fcfcf9] rounded-xl border border-zinc-300 shadow-sm overflow-hidden"
@@ -802,6 +879,7 @@ export default function FloorPlanCanvas({
         {/* ======== LAYER 1: Rooms + Doors + Windows ======== */}
         <Layer>
           {grouped.map(([key, parts]) => {
+            const displayName = parts[0].displayLabel || parts[0].name;
             const name = parts[0].name;
             const center = roomCenter(parts[0]);
             const cPx = toCanvas(center.x, center.y, s, bb);
@@ -875,10 +953,17 @@ export default function FloorPlanCanvas({
           })}
         </Layer>
 
-        {/* ======== LAYER 2: Furniture ======== */}
+        {/* ======== LAYER 2a: Rugs (below other furniture) ======== */}
         {placedFurniture && placedFurniture.length > 0 && (
           <Layer>
-            {placedFurniture.map((pf, i) => renderFurnitureItem(pf, i))}
+            {placedFurniture.filter(pf => pf.itemId.includes("rug")).map((pf, i) => renderFurnitureItem(pf, i))}
+          </Layer>
+        )}
+
+        {/* ======== LAYER 2b: All other furniture ======== */}
+        {placedFurniture && placedFurniture.length > 0 && (
+          <Layer>
+            {placedFurniture.filter(pf => !pf.itemId.includes("rug")).map((pf, i) => renderFurnitureItem(pf, i))}
           </Layer>
         )}
 
@@ -906,6 +991,27 @@ export default function FloorPlanCanvas({
             <Text x={-5} y={11} text="N" fontSize={10} fontStyle="bold" fill="#3a3a4a" width={10} align="center" />
           </Group>
 
+          {/* E.Hallway marker — building shared corridor (apartments only) */}
+          {entranceApproach && (() => {
+            const ePos = toCanvas(entranceApproach.eHallX, entranceApproach.eHallY, s, bb);
+            return (
+              <Group>
+                {/* E.Hallway label — small rectangle outside the building, near the main entrance */}
+                <Rect
+                  x={ePos.x - 30} y={ePos.y - 10}
+                  width={60} height={18}
+                  fill="#fef3c7" stroke="#e67e22" strokeWidth={1.2}
+                  cornerRadius={4}
+                />
+                <Text
+                  x={ePos.x - 28} y={ePos.y - 8}
+                  text="E.Hallway" fontSize={9} fontStyle="bold" fill="#b45309"
+                  width={56} height={14} align="center" verticalAlign="middle"
+                />
+              </Group>
+            );
+          })()}
+
           {/* Scale bar */}
           <Group x={16} y={STAGE_H - 20}>
             <Line points={[0, 0, 5 * s, 0]} stroke="#3a3a4a" strokeWidth={1.5} />
@@ -920,12 +1026,12 @@ export default function FloorPlanCanvas({
           {grouped.map(([key, parts]) => {
             const center = roomCenter(parts[0]);
             const cPx = toCanvas(center.x, center.y, s, bb);
-            const name = parts[0].name;
+            const displayName = parts[0].displayLabel || parts[0].name;
             const totalArea = parts.reduce((sum, p) => sum + p.area, 0);
             return (
               <Group key={`label-${key}`}>
                 <Text x={cPx.x - 55} y={cPx.y - 20} width={110} height={18}
-                  text={name} fontSize={11} fontStyle="bold" fill="#2d2d3f"
+                  text={displayName} fontSize={11} fontStyle="bold" fill="#2d2d3f"
                   align="center" verticalAlign="middle" fontFamily="system-ui, sans-serif"
                   shadowColor="#ffffff" shadowBlur={3} shadowOpacity={0.8} />
                 <Text x={cPx.x - 55} y={cPx.y} width={110} height={14}
