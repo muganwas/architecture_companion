@@ -174,7 +174,7 @@ export async function generateFloorPlan(
   // Try abstract plan format (layout engine), fall back to legacy coordinates
   if (parsed.zones && parsed.roomRatios) {
     const layout = computeLayout(parsed as AbstractPlan);
-    const furniture = suggestFurniture(layout.rooms);
+    const furniture = suggestFurniture(layout.rooms, layout.doors);
 
     // Validate: check which requested rooms couldn't fit
     const warnings = validateRoomPlacement(input.description, parsed as AbstractPlan, layout.rooms);
@@ -195,7 +195,8 @@ export async function generateFloorPlan(
 
   // Legacy format
   const legacyRooms: GeneratedRoom[] = parsed.rooms || [];
-  const legacyFurniture = suggestFurniture(legacyRooms);
+  const legacyDoors: Door[] = parsed.doors || [];
+  const legacyFurniture = suggestFurniture(legacyRooms, legacyDoors);
   // Validate against user description
   const legacyWarnings = validateRoomPlacement(
     input.description,

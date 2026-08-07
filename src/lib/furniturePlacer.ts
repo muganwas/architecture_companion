@@ -3,10 +3,105 @@
 /*  Based on room type, size, and furniture dimensions                 */
 /* ------------------------------------------------------------------ */
 
-import { GeneratedRoom } from "./ai-client";
+import { GeneratedRoom, Door } from "./ai-client";
 import { PlacedFurniture } from "./furniture";
 import { getFurnitureForRoom, getFurnitureById } from "./furniture";
 import { isFurnitureInBounds } from "./layoutEngine";
+
+/* ------------------------------------------------------------------ */
+/*  Door obstruction zones                                             */
+/* ------------------------------------------------------------------ */
+
+/** Represents a rectangular zone that a door's swing occupies */
+interface DoorZone {
+  x: number;       // center x of the zone
+  y: number;       // center y of the zone
+  halfW: number;   // half-width of the zone
+  halfH: number;   // half-height of the zone
+}
+
+/**
+ * Compute the obstruction zone for a door's swing path.
+ * For swing="in", the zone extends inward from the door by the door width.
+ * For swing="out", we still reserve a small walkway clearance inside.
+ */
+function getDoorZone(door: Door, room: GeneratedRoom): DoorZone | null {
+  const clearance = door.swing === "in" ? door.width + 0.15 : 0.5;
+
+  switch (door.wall) {
+    case "bottom": {
+      // Door on bottom wall (y ≈ room.y), swings upward into room
+      const doorLeft = room.x + door.offset - door.width / 2;
+      return {
+        x: doorLeft + door.width / 2,
+        y: room.y + clearance / 2,
+        halfW: door.width / 2,
+        halfH: clearance / 2,
+      };
+    }
+    case "top": {
+      // Door on top wall (y ≈ room.y + room.height), swings downward
+      const doorLeft = room.x + door.offset - door.width / 2;
+      return {
+        x: doorLeft + door.width / 2,
+        y: room.y + room.height - clearance / 2,
+        halfW: door.width / 2,
+        halfH: clearance / 2,
+      };
+    }
+    case "left": {
+      // Door on left wall (x ≈ room.x), swings rightward
+      const doorTop = room.y + door.offset - door.width / 2;
+      return {
+        x: room.x + clearance / 2,
+        y: doorTop + door.width / 2,
+        halfW: clearance / 2,
+        halfH: door.width / 2,
+      };
+    }
+    case "right": {
+      // Door on right wall (x ≈ room.x + room.width), swings leftward
+      const doorTop = room.y + door.offset - door.width / 2;
+      return {
+        x: room.x + room.width - clearance / 2,
+        y: doorTop + door.width / 2,
+        halfW: clearance / 2,
+        halfH: door.width / 2,
+      };
+    }
+  }
+}
+
+/**
+ * Build the list of door obstruction zones for a given room.
+ */
+function getRoomDoorZones(room: GeneratedRoom, allDoors: Door[]): DoorZone[] {
+  return allDoors
+    .filter(d => d.room === room.name)
+    .map(d => getDoorZone(d, room))
+    .filter((z): z is DoorZone => z !== null);
+}
+
+/**
+ * Check if a furniture item (defined by center + half-dimensions) overlaps
+ * any door obstruction zone in the room.
+ */
+function overlapsDoorZone(
+  itemX: number, itemY: number,
+  itemHalfW: number, itemHalfH: number,
+  doorZones: DoorZone[]
+): boolean {
+  const margin = 0.05;
+  for (const zone of doorZones) {
+    if (
+      Math.abs(itemX - zone.x) < itemHalfW + zone.halfW + margin &&
+      Math.abs(itemY - zone.y) < itemHalfH + zone.halfH + margin
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
 
 /**
  * Smart placement: tries original position, polygon centroid, scaled down, rotated.
@@ -215,9 +310,16 @@ function sameGroup(id1: string, id2: string): boolean {
 /**
  * Place furniture into rooms based on room type and dimensions.
  * Returns an array of placed furniture items with world-space coordinates.
+ * Doors are used to avoid placing furniture in door swing paths.
  */
-export function suggestFurniture(rooms: GeneratedRoom[]): PlacedFurniture[] {
+export function suggestFurniture(rooms: GeneratedRoom[], doors: Door[] = []): PlacedFurniture[] {
   const placed: PlacedFurniture[] = [];
+
+  // Pre-compute door obstruction zones per room
+  const doorZonesByRoom = new Map<string, DoorZone[]>();
+  for (const room of rooms) {
+    doorZonesByRoom.set(room.name, getRoomDoorZones(room, doors));
+  }
 
   // Sort: ensuite first (so master bedroom furniture can avoid it), then others
   const sortedRooms = [...rooms].sort((a, b) => {
@@ -242,84 +344,182 @@ export function suggestFurniture(rooms: GeneratedRoom[]): PlacedFurniture[] {
 
     const name = room.name.toLowerCase();
 
-    /* ---- LIVING ROOM ---- */
+    /* ---- LIVING ROOM (door-aware) ---- */
     if (/living|lounge|family|media/i.test(name)) {
-      // Sofa along the long wall
-      const sofa = getFurnitureById("sofa-3-seater");
-      if (sofa && rw >= sofa.width + 0.3) {
-        placed.push({
-          itemId: "sofa-3-seater",
-          room: room.name,
-          x: cx,
-          y: room.y + rh * 0.72,
-          rotation: 0,
-          scale: 1.0,
-        });
+      const doorZones = doorZonesByRoom.get(room.name) || [];
+
+      // Determine which walls have doors
+      const hasBottomDoor = doorZones.some(z => Math.abs(z.y - (room.y + z.halfH)) < 0.3);
+      const hasTopDoor = doorZones.some(z => Math.abs(z.y - (room.y + room.height - z.halfH)) < 0.3);
+      const hasLeftDoor = doorZones.some(z => Math.abs(z.x - (room.x + z.halfW)) < 0.3);
+      const hasRightDoor = doorZones.some(z => Math.abs(z.x - (room.x + room.width - z.halfW)) < 0.3);
+
+      // TV placement: avoid walls with doors, prefer a wall without doors
+      // Default: TV on bottom wall (y = rh * 0.12), sofa on top wall (y = rh * 0.72)
+      let tvY = room.y + rh * 0.12;
+      let tvWall = "bottom";
+
+      if (hasBottomDoor && !hasTopDoor) {
+        // Bottom has door → TV on top, sofa on bottom
+        tvY = room.y + rh * 0.88;
+        tvWall = "top";
+      } else if (hasBottomDoor && hasTopDoor) {
+        // Both top and bottom have doors → try side walls
+        if (!hasLeftDoor) {
+          // TV on left wall, sofa on right
+          tvWall = "left";
+        } else if (!hasRightDoor) {
+          // TV on right wall, sofa on left
+          tvWall = "right";
+        }
+        // If all walls have doors, default to bottom (best effort)
       }
 
-      // Coffee table in front of sofa
+      // Sofa — place opposite the TV
+      const sofa = getFurnitureById("sofa-3-seater");
+      if (sofa && rw >= sofa.width + 0.3) {
+        if (tvWall === "bottom") {
+          placed.push({
+            itemId: "sofa-3-seater",
+            room: room.name,
+            x: cx,
+            y: room.y + rh * 0.72,
+            rotation: 0,
+            scale: 1.0,
+          });
+        } else if (tvWall === "top") {
+          placed.push({
+            itemId: "sofa-3-seater",
+            room: room.name,
+            x: cx,
+            y: room.y + rh * 0.28,
+            rotation: 0,
+            scale: 1.0,
+          });
+        } else if (tvWall === "left") {
+          placed.push({
+            itemId: "sofa-3-seater",
+            room: room.name,
+            x: room.x + room.width * 0.75,
+            y: cy,
+            rotation: 90,
+            scale: 1.0,
+          });
+        } else if (tvWall === "right") {
+          placed.push({
+            itemId: "sofa-3-seater",
+            room: room.name,
+            x: room.x + room.width * 0.25,
+            y: cy,
+            rotation: 270,
+            scale: 1.0,
+          });
+        }
+      }
+
+      // Coffee table — between sofa and TV
       if (roomArea >= 15) {
+        const coffeeY = tvWall === "bottom"
+          ? room.y + rh * 0.45
+          : tvWall === "top"
+            ? room.y + rh * 0.55
+            : cy;
+        const coffeeX = tvWall === "left"
+          ? room.x + room.width * 0.45
+          : tvWall === "right"
+            ? room.x + room.width * 0.55
+            : cx;
         placed.push({
           itemId: "coffee-table",
           room: room.name,
-          x: cx,
-          y: room.y + rh * 0.45,
+          x: coffeeX,
+          y: coffeeY,
           rotation: 0,
           scale: 1.0,
         });
       }
 
-      // TV unit opposite sofa
-      if (rw >= 1.5) {
+      // TV unit — place on the wall opposite to door, or best available wall
+      if (rw >= 1.5 || rh >= 1.5) {
+        let tvX = cx;
+        let tvRot: 0 | 90 | 180 | 270 = 0;
+
+        if (tvWall === "bottom") {
+          tvX = cx;
+          tvY = room.y + rh * 0.12;
+          tvRot = 0;
+        } else if (tvWall === "top") {
+          tvX = cx;
+          tvY = room.y + rh * 0.88;
+          tvRot = 0;
+        } else if (tvWall === "left") {
+          tvX = room.x + room.width * 0.12;
+          tvY = cy;
+          tvRot = 90;
+        } else {
+          // right
+          tvX = room.x + room.width * 0.88;
+          tvY = cy;
+          tvRot = 270;
+        }
+
         placed.push({
           itemId: "tv-unit",
           room: room.name,
-          x: cx,
-          y: room.y + rh * 0.12,
-          rotation: 0,
+          x: tvX,
+          y: tvY,
+          rotation: tvRot,
           scale: 1.0,
         });
       }
 
       // Armchairs for larger rooms
       if (roomArea >= 25) {
-        placed.push({
-          itemId: "armchair",
-          room: room.name,
-          x: room.x + rw * 0.15,
-          y: room.y + rh * 0.45,
-          rotation: 270,
-          scale: 1.0,
-        });
-        placed.push({
-          itemId: "armchair",
-          room: room.name,
-          x: room.x + rw * 0.85,
-          y: room.y + rh * 0.45,
-          rotation: 90,
-          scale: 1.0,
-        });
+        if (tvWall === "bottom" || tvWall === "top") {
+          placed.push({
+            itemId: "armchair",
+            room: room.name,
+            x: room.x + rw * 0.15,
+            y: room.y + rh * 0.45,
+            rotation: 270,
+            scale: 1.0,
+          });
+          placed.push({
+            itemId: "armchair",
+            room: room.name,
+            x: room.x + rw * 0.85,
+            y: room.y + rh * 0.45,
+            rotation: 90,
+            scale: 1.0,
+          });
+        }
       }
 
       // Rug under coffee table for larger rooms
       if (roomArea >= 22) {
+        const rugY = tvWall === "bottom"
+          ? room.y + rh * 0.48
+          : tvWall === "top"
+            ? room.y + rh * 0.52
+            : cy;
         placed.push({
           itemId: "rug-large",
           room: room.name,
           x: cx,
-          y: room.y + rh * 0.48,
+          y: rugY,
           rotation: 0,
           scale: 1.0,
         });
       }
 
-      // Side tables
-      if (rw >= 3) {
+      // Side tables — near sofa, not near doors
+      if (rw >= 3 && (tvWall === "bottom" || tvWall === "top")) {
+        const sofaSide = tvWall === "bottom" ? rh * 0.7 : rh * 0.3;
         placed.push({
           itemId: "side-table",
           room: room.name,
           x: room.x + rw * 0.12,
-          y: room.y + rh * 0.7,
+          y: room.y + sofaSide,
           rotation: 0,
           scale: 1.0,
         });
@@ -327,19 +527,32 @@ export function suggestFurniture(rooms: GeneratedRoom[]): PlacedFurniture[] {
           itemId: "side-table",
           room: room.name,
           x: room.x + rw * 0.88,
-          y: room.y + rh * 0.7,
+          y: room.y + sofaSide,
           rotation: 0,
           scale: 1.0,
         });
       }
 
-      // Plant
+      // Plant — place in a corner without a door
       if (roomArea >= 20 && rw >= 3) {
+        // Find a corner without a door obstruction zone
+        const plantCorners = [
+          { x: room.x + rw * 0.08, y: room.y + rh * 0.12, label: "bottom-left" },
+          { x: room.x + rw * 0.92, y: room.y + rh * 0.12, label: "bottom-right" },
+          { x: room.x + rw * 0.08, y: room.y + rh * 0.88, label: "top-left" },
+          { x: room.x + rw * 0.92, y: room.y + rh * 0.88, label: "top-right" },
+        ];
+        const plantItem = getFurnitureById("plant-indoor");
+        const plantHalf = plantItem ? plantItem.width / 2 : 0.2;
+        const bestCorner = plantCorners.find(c =>
+          !overlapsDoorZone(c.x, c.y, plantHalf, plantHalf, doorZones)
+        ) || plantCorners[0];
+
         placed.push({
           itemId: "plant-indoor",
           room: room.name,
-          x: room.x + rw * 0.08,
-          y: room.y + rh * 0.12,
+          x: bestCorner.x,
+          y: bestCorner.y,
           rotation: 0,
           scale: 1.0,
         });
@@ -765,6 +978,8 @@ export function suggestFurniture(rooms: GeneratedRoom[]): PlacedFurniture[] {
     "stove-4-burner", "refrigerator", "kitchen-sink",
     "kitchen-counter-straight", "kitchen-counter-small", "kitchen-counter-corner", "kitchen-island",
     "wardrobe", "desk",
+    // Living room core: sofa + rug + TV are the highest-priority decor items
+    "sofa-3-seater", "sofa-2-seater", "tv-unit", "rug-large",
   ]);
   // Note: "bathtub" NOT in essentialIds — it gets full bounds check;
   // if it doesn't fit even after smartPlace, shower is substituted below
@@ -773,6 +988,8 @@ export function suggestFurniture(rooms: GeneratedRoom[]): PlacedFurniture[] {
   const forceItems = new Set([
     "kitchen-counter-straight", "kitchen-counter-small", "stove-4-burner",
     "toilet", "kitchen-sink",
+    // Living room core items always appear
+    "sofa-3-seater", "sofa-2-seater", "tv-unit", "rug-large",
   ]);
 
   const validated: PlacedFurniture[] = [];
@@ -794,9 +1011,32 @@ export function suggestFurniture(rooms: GeneratedRoom[]): PlacedFurniture[] {
     const ih = (isRotated ? item.width : item.height) * pf.scale;
     const fits = isFurnitureInBounds(pf.x, pf.y, iw, ih, room);
     const collides = fits && collidesWithExisting(pf.x, pf.y, iw, ih, pf.room, validated, pf.itemId);
+    // Check door zone overlap (non-essential items should avoid door swing paths)
+    const roomDoorZones = doorZonesByRoom.get(pf.room) || [];
+    const inDoorZone = fits && !collides && overlapsDoorZone(pf.x, pf.y, iw / 2, ih / 2, roomDoorZones);
 
-    if (fits && !collides) {
+    if (fits && !collides && !inDoorZone) {
       validated.push(pf);
+      continue;
+    }
+
+    // In door zone but fits otherwise — for forceItems, accept as-is
+    // (door-aware placement already found the best position);
+    // for other essentials, try smartPlace; skip non-essentials
+    if (inDoorZone && fits && !collides) {
+      if (forceItems.has(pf.itemId)) {
+        // Core item: keep it even in a door zone — placement was already optimized
+        validated.push(pf);
+        continue;
+      }
+      if (essentialIds.has(pf.itemId)) {
+        const fixed = smartPlace(pf.itemId, room, pf.x, pf.y, pf.rotation, pf.scale, validated);
+        if (fixed) {
+          validated.push(fixed);
+          continue;
+        }
+      }
+      // Non-essential item in door zone: skip it silently
       continue;
     }
 
