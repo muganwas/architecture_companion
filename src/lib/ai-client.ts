@@ -190,6 +190,30 @@ export async function generateFloorPlan(
     });
     const furniture = suggestFurniture(layout.rooms, layout.doors, layout.windows);
 
+    // ── Post-furniture check: if an ensuite has no toilet, sink, or shower/bathtub,
+    //     it's not functional — remove it and warn the user.
+    const ensuiteRoom = layout.rooms.find(r => /ensuite/i.test(r.name));
+    if (ensuiteRoom) {
+      const ensuiteFurniture = furniture.filter(f => f.room === ensuiteRoom.name);
+      const hasToilet = ensuiteFurniture.some(f => f.itemId === "toilet");
+      const hasSink = ensuiteFurniture.some(f => f.itemId === "sink-bathroom");
+      const hasShowerOrTub = ensuiteFurniture.some(f => f.itemId === "shower" || f.itemId === "bathtub");
+      if (!hasToilet || !hasSink || !hasShowerOrTub) {
+        // Remove non-functional ensuite
+        const idx = layout.rooms.indexOf(ensuiteRoom);
+        if (idx >= 0) layout.rooms.splice(idx, 1);
+        // Remove its door
+        layout.doors = layout.doors.filter(d => d.room !== "Ensuite");
+        // Remove its furniture
+        for (let i = furniture.length - 1; i >= 0; i--) {
+          if (furniture[i].room === "Ensuite") furniture.splice(i, 1);
+        }
+        const missing = [!hasToilet && "toilet", !hasSink && "sink", !hasShowerOrTub && "shower/bathtub"]
+          .filter(Boolean).join(", ");
+        console.warn(`[ensuite] ⚠️ removed — master too tight for functional ensuite (missing: ${missing}).`);
+      }
+    }
+
     // Validate: check which requested rooms couldn't fit
     const warnings = validateRoomPlacement(input.description, parsed as AbstractPlan, layout.rooms);
 

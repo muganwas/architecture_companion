@@ -179,7 +179,8 @@ function wallPlace(
   room: GeneratedRoom,
   rotation: number,
   scale: number,
-  existingItems: PlacedFurniture[]
+  existingItems: PlacedFurniture[],
+  obstZones?: ObstructionZone[]
 ): PlacedFurniture | null {
   const item = getFurnitureById(itemId);
   if (!item) return null;
@@ -187,27 +188,36 @@ function wallPlace(
   const rw = room.width, rh = room.height;
   const margin = 0.3;
 
-  // Build wall-adjacent positions using ONLY the specified rotation
+  // The "depth into room" is always the item's height dimension —
+  // at rot=0/180 height goes into Y (top/bottom walls),
+  // at rot=90/270 height goes into X (left/right walls).
+  const halfDepth = item.height / 2;
+
+  // Build wall-adjacent positions — try center AND offset positions along each wall
+  // so furniture can avoid central doors/windows.
   const positions: Array<{ x: number; y: number; rot: number }> = [];
-  const halfDepth = (rotation === 90 || rotation === 270 ? item.width : item.height) / 2;
-  const halfLength = (rotation === 90 || rotation === 270 ? item.height : item.width) / 2;
+  const offsets = [0.5, 0.25, 0.75]; // center, left-third, right-third along wall
 
   if (rotation === 0 || rotation === 180) {
-    // Horizontal: top and bottom walls
-    positions.push(
-      { x: room.x + rw / 2, y: room.y + margin + halfDepth, rot: 0 },
-      { x: room.x + rw / 2, y: room.y + rh - margin - halfDepth, rot: 0 },
-    );
-  }
-  if (rotation === 90 || rotation === 270) {
-    // Vertical: left and right walls
-    positions.push(
-      { x: room.x + margin + halfDepth, y: room.y + rh / 2, rot: 90 },
-      { x: room.x + rw - margin - halfDepth, y: room.y + rh / 2, rot: 90 },
-    );
-  }
-  // If rotation is something else, try both orientations
-  if (positions.length === 0) {
+    // Horizontal: top and bottom walls — try multiple positions along X
+    for (const frac of offsets) {
+      const wx = room.x + rw * frac;
+      positions.push(
+        { x: wx, y: room.y + margin + halfDepth, rot: 0 },
+        { x: wx, y: room.y + rh - margin - halfDepth, rot: 0 },
+      );
+    }
+  } else if (rotation === 90 || rotation === 270) {
+    // Vertical: left and right walls — try multiple positions along Y
+    for (const frac of offsets) {
+      const wy = room.y + rh * frac;
+      positions.push(
+        { x: room.x + margin + halfDepth, y: wy, rot: 90 },
+        { x: room.x + rw - margin - halfDepth, y: wy, rot: 90 },
+      );
+    }
+  } else {
+    // Unknown rotation — try both orientations at center only
     positions.push(
       { x: room.x + rw / 2, y: room.y + margin + item.height / 2, rot: 0 },
       { x: room.x + rw / 2, y: room.y + rh - margin - item.height / 2, rot: 0 },
@@ -224,6 +234,8 @@ function wallPlace(
 
       if (!isFurnitureInBounds(pos.x, pos.y, iw, ih, room)) continue;
       if (collidesWithExisting(pos.x, pos.y, iw, ih, room.name, existingItems, itemId)) continue;
+      // Check door/window obstruction zones
+      if (obstZones && overlapsObstruction(pos.x, pos.y, iw / 2, ih / 2, obstZones)) continue;
 
       return { itemId, room: room.name, x: pos.x, y: pos.y, rotation: pos.rot as 0 | 90 | 180 | 270, scale: s };
     }
@@ -290,8 +302,10 @@ function collidesWithExisting(
     if (sameGroup(myItemId, pf.itemId)) continue;
 
     const item = getFurnitureById(pf.itemId);
-    // Virtual obstacle blocks the entire ensuite area
+    // Virtual obstacle blocks the entire ensuite area — but beds can overlap it
+    // since they're placed against walls, not in the middle of the room.
     if (!item && pf.itemId === "__ensuite_obstacle__") {
+      if (myItemId.startsWith("bed-")) continue; // beds ignore ensuite obstacle
       const obsHalfW = 1.0 + margin; // ensuite half-width (2m wide)
       const obsHalfH = 1.25 + margin; // ensuite half-height (2.5m tall)
       if (Math.abs(x - pf.x) < halfW + obsHalfW && Math.abs(y - pf.y) < halfH + obsHalfH) {
@@ -321,7 +335,7 @@ function sameGroup(id1: string, id2: string): boolean {
   const kitchenItems = ["kitchen-counter", "stove", "refrigerator", "kitchen-sink"]; // island excluded — must not overlap counter
   const bathItems = ["toilet", "sink-bathroom", "bathtub", "shower"];
   const livingItems = ["sofa", "coffee-table", "tv-unit", "armchair", "side-table", "rug-large"];
-  const bedItems = ["bed-", "side-table", "rug-large"]; // wardrobe intentionally excluded — must not overlap bed
+  const bedItems = ["bed-", "side-table"]; // wardrobe intentionally excluded — must not overlap bed
 
   const groups = [kitchenItems, bathItems, livingItems, bedItems];
   for (const group of groups) {
@@ -337,6 +351,24 @@ function sameGroup(id1: string, id2: string): boolean {
  * Returns an array of placed furniture items with world-space coordinates.
  * Doors are used to avoid placing furniture in door swing paths.
  */
+/** Compute a room-size-appropriate furniture scale factor.
+ *  Furniture in larger rooms scales up so it doesn't look lost;
+ *  furniture in smaller rooms scales down to fit. */
+function getRoomFurnitureScale(room: GeneratedRoom): number {
+  const name = room.name.toLowerCase();
+  let standardArea = 14; // default for bedrooms
+  if (/master/i.test(name)) standardArea = 22;
+  else if (/living|lounge|family/i.test(name)) standardArea = 28;
+  else if (/kitchen/i.test(name)) standardArea = 14;
+  else if (/bedroom/i.test(name)) standardArea = 14;
+  else if (/bathroom|ensuite/i.test(name)) standardArea = 6;
+  else if (/dining/i.test(name)) standardArea = 12;
+  else if (/office|study/i.test(name)) standardArea = 10;
+
+  const ratio = Math.sqrt(room.area / standardArea);
+  return Math.max(0.8, Math.min(1.35, ratio));
+}
+
 export function suggestFurniture(rooms: GeneratedRoom[], doors: Door[] = [], windows: Window[] = []): PlacedFurniture[] {
   const placed: PlacedFurniture[] = [];
 
@@ -366,6 +398,7 @@ export function suggestFurniture(rooms: GeneratedRoom[], doors: Door[] = [], win
     const rh = room.height;
     const minDim = Math.min(rw, rh);
     const roomArea = room.area;
+    const roomScale = getRoomFurnitureScale(room);
 
     const name = room.name.toLowerCase();
 
@@ -400,9 +433,9 @@ export function suggestFurniture(rooms: GeneratedRoom[], doors: Door[] = [], win
         // If all walls have doors, default to bottom (best effort)
       }
 
-      // Sofa — place opposite the TV
+      // Sofa — place opposite the TV, scale with room
       const sofa = getFurnitureById("sofa-3-seater");
-      if (sofa && rw >= sofa.width + 0.3) {
+      if (sofa && rw >= sofa.width * roomScale + 0.3) {
         if (tvWall === "bottom") {
           placed.push({
             itemId: "sofa-3-seater",
@@ -410,7 +443,7 @@ export function suggestFurniture(rooms: GeneratedRoom[], doors: Door[] = [], win
             x: cx,
             y: room.y + rh * 0.72,
             rotation: 0,
-            scale: 1.0,
+            scale: roomScale,
           });
         } else if (tvWall === "top") {
           placed.push({
@@ -419,7 +452,7 @@ export function suggestFurniture(rooms: GeneratedRoom[], doors: Door[] = [], win
             x: cx,
             y: room.y + rh * 0.28,
             rotation: 0,
-            scale: 1.0,
+            scale: roomScale,
           });
         } else if (tvWall === "left") {
           placed.push({
@@ -428,7 +461,7 @@ export function suggestFurniture(rooms: GeneratedRoom[], doors: Door[] = [], win
             x: room.x + room.width * 0.75,
             y: cy,
             rotation: 90,
-            scale: 1.0,
+            scale: roomScale,
           });
         } else if (tvWall === "right") {
           placed.push({
@@ -437,7 +470,7 @@ export function suggestFurniture(rooms: GeneratedRoom[], doors: Door[] = [], win
             x: room.x + room.width * 0.25,
             y: cy,
             rotation: 270,
-            scale: 1.0,
+            scale: roomScale,
           });
         }
       }
@@ -460,7 +493,7 @@ export function suggestFurniture(rooms: GeneratedRoom[], doors: Door[] = [], win
           x: coffeeX,
           y: coffeeY,
           rotation: 0,
-          scale: 1.0,
+          scale: roomScale,
         });
       }
 
@@ -520,7 +553,7 @@ export function suggestFurniture(rooms: GeneratedRoom[], doors: Door[] = [], win
         }
       }
 
-      // Rug under coffee table for larger rooms
+      // Rug under coffee table for larger rooms, scale with room
       if (roomArea >= 22) {
         const rugY = tvWall === "bottom"
           ? room.y + rh * 0.48
@@ -533,7 +566,7 @@ export function suggestFurniture(rooms: GeneratedRoom[], doors: Door[] = [], win
           x: cx,
           y: rugY,
           rotation: 0,
-          scale: 1.0,
+          scale: roomScale,
         });
       }
 
@@ -588,7 +621,7 @@ export function suggestFurniture(rooms: GeneratedRoom[], doors: Door[] = [], win
     if (/dining/i.test(name)) {
       // Scale table based on room size
       const tableId = roomArea >= 20 ? "dining-table-6" : "dining-table-4";
-      const tableScale = roomArea < 8 ? 0.65 : roomArea < 12 ? 0.8 : 1.0;
+      const tableScale = roomScale * (roomArea < 8 ? 0.7 : roomArea < 12 ? 0.85 : 1.0);
       const table = getFurnitureById(tableId);
       if (table) {
         placed.push({
@@ -654,92 +687,111 @@ export function suggestFurniture(rooms: GeneratedRoom[], doors: Door[] = [], win
       const bedId = isMaster ? "bed-queen" : roomArea >= 14 ? "bed-double" : "bed-single";
       const bed = getFurnitureById(bedId);
 
-      // Always place a bed — scale down if room is very small
+      // ALWAYS horizontal (rot=0). Headboard against the BACK wall.
+      // If the bed is too wide for the room, scale down to fit.
+      // No rotation — eliminates all headboard-placement complexity.
       let bedY = cy;
-      let bedH = 0;
+      let bedX = cx;
+      let bedWorldH = 0;
+      let bedWorldW = 0;
       if (bed) {
-        const bedScale = roomArea < 9 ? 0.75 : 1.0;
-        const bedX = cx;
-        bedY = room.y + (bed.height * bedScale) / 2 + 0.15;
-        bedH = (rw > rh ? bed.height : bed.width) * bedScale;
+        let bedScale = (roomArea < 9 ? 0.85 : 1.0);
+        // Scale down if bed is wider than room
+        if (bed.width * bedScale > rw - 0.3) {
+          bedScale = (rw - 0.3) / bed.width;
+        }
+        bedWorldW = bed.width * bedScale;
+        bedWorldH = bed.height * bedScale;
+
+        // Headboard (local y=0) maps to world y = bedY + bedWorldH/2 (due to Y-flip in toCanvas)
+        // Place against BACK wall: bedY + bedWorldH/2 = room.y + room.height - 0.15
+        bedY = room.y + room.height - bedWorldH / 2 - 0.15;
+        bedX = cx;
+
+        console.log(`[bed] "${bedId}" in "${room.name}" rot=0 wh=(${bedWorldW.toFixed(2)},${bedWorldH.toFixed(2)}) center=(${bedX.toFixed(2)},${bedY.toFixed(2)}) room=${rw.toFixed(1)}×${rh.toFixed(1)}`);
+
         placed.push({
           itemId: bedId,
           room: room.name,
           x: bedX,
           y: bedY,
-          rotation: rw > rh ? 0 : 90,
+          rotation: 0,
           scale: bedScale,
         });
 
-        // Side tables flanking the headboard (pillow side)
-        const bedRot = rw > rh ? 0 : 90;
-        const bedW = (bedRot === 0 ? bed.width : bed.height) * bedScale;
-        // Head position: for rot=0, head is at higher y; for rot=90, head is at lower x
-        const headX = bedRot === 0 ? bedX : bedX - bedH / 2 - 0.3;
-        const headY = bedRot === 0 ? bedY + bedH * 0.25 : bedY;
-        // Place one side table at the head (pillow side)
-        const st1X = bedRot === 0 ? bedX - bedW / 2 - 0.3 : headX;
-        const st1Y = bedRot === 0 ? headY : bedY - bedW / 2 - 0.3;
-        placed.push({
-          itemId: "side-table", room: room.name,
-          x: st1X, y: st1Y, rotation: 0, scale: bedScale,
-        });
-        // Second side table if room is large enough
+        // Side tables flanking the headboard along the back wall
+        const stX1 = bedX - bedWorldW / 2 - 0.3;
+        const stX2 = bedX + bedWorldW / 2 + 0.3;
+        const stY = room.y + room.height - 0.3;
+        placed.push({ itemId: "side-table", room: room.name, x: stX1, y: stY, rotation: 0, scale: bedScale });
         if (roomArea >= 12) {
-          const st2X = bedRot === 0 ? bedX + bedW / 2 + 0.3 : headX;
-          const st2Y = bedRot === 0 ? headY : bedY + bedW / 2 + 0.3;
-          placed.push({
-            itemId: "side-table", room: room.name,
-            x: st2X, y: st2Y, rotation: 0, scale: bedScale,
-          });
+          placed.push({ itemId: "side-table", room: room.name, x: stX2, y: stY, rotation: 0, scale: bedScale });
         }
       }
 
-      // Wardrobe — always against a wall, never in the middle of the room.
-      // Try right wall first (opposite typical bed position), then left wall, then top.
+      // Wardrobe — always against a wall, avoiding doors/windows
       const wardScale = minDim >= 3 ? 1.0 : 0.8;
-      let wardResult = wallPlace("wardrobe", room, 0, wardScale, placed);
-      if (!wardResult) wardResult = wallPlace("wardrobe", room, 90, wardScale, placed);
-      if (!wardResult) wardResult = wallPlace("wardrobe", room, 180, wardScale, placed);
+      const wardObstZones = obstructionZonesByRoom.get(room.name) || [];
+      let wardResult: PlacedFurniture | null = null;
+      const wardRotations = [90, 270, 0, 180];
+      for (const wr of wardRotations) {
+        wardResult = wallPlace("wardrobe", room, wr as 0 | 90 | 180 | 270, wardScale, placed, wardObstZones);
+        if (wardResult) break;
+      }
+      // Try smaller scales
       if (!wardResult) {
-        // Last resort: smartPlace against any wall
+        for (const scale of [0.75, 0.65, 0.55]) {
+          for (const wr of wardRotations) {
+            wardResult = wallPlace("wardrobe", room, wr as 0 | 90 | 180 | 270, scale, placed, wardObstZones);
+            if (wardResult) break;
+          }
+          if (wardResult) break;
+        }
+      }
+      if (!wardResult) {
         wardResult = smartPlace("wardrobe", room, room.x + rw - 0.5, room.y + rh - 0.5, 0, wardScale, placed,
           obstructionZonesByRoom.get(room.name), "wardrobe");
       }
       if (wardResult) placed.push(wardResult);
 
-      // Rug at foot of bed — past the foot, never overlapping the mattress
-      if (bed && roomArea >= 14) {
-        const rugItem = getFurnitureById("rug-large");
-        const rugHalfH = rugItem ? (rugItem.height * 0.8) / 2 : 0.56; // rug half-height at scale 0.8
-        placed.push({
-          itemId: "rug-large",
-          room: room.name,
-          x: cx,
-          y: bedY + bedH * 0.5 + rugHalfH + 0.2,
-          rotation: 0,
-          scale: 0.8,
-        });
-      }
-
-      // Desk for master or larger bedrooms
+      // Desk for master or larger bedrooms — prefer back wall, avoid windows/doors
       if (roomArea >= 14 && rw >= 2 && rh >= 2.5) {
-        placed.push({
-          itemId: "desk",
-          room: room.name,
-          x: room.x + 0.9,
-          y: room.y + rh - 0.5,
-          rotation: 0,
-          scale: 0.9,
-        });
-        placed.push({
-          itemId: "office-chair",
-          room: room.name,
-          x: room.x + 0.9,
-          y: room.y + rh - 1.0,
-          rotation: 0,
-          scale: 1.0,
-        });
+        const bedObstZones = obstructionZonesByRoom.get(room.name) || [];
+        // Try right side of back wall first, then alternative positions
+        const deskPrefs = [
+          { x: room.x + rw - 0.9, y: room.y + rh - 0.5, rot: 0 },
+          { x: room.x + 0.9, y: room.y + rh - 0.5, rot: 0 },
+          { x: room.x + rw - 0.5, y: room.y + 0.9, rot: 180 },
+          { x: room.x + 0.5, y: room.y + 0.9, rot: 180 },
+        ];
+        let deskResult: PlacedFurniture | null = null;
+        const deskItem = getFurnitureById("desk");
+        if (deskItem) {
+          for (const dp of deskPrefs) {
+            const dw = deskItem.width * 0.9;
+            const dh = deskItem.height * 0.9;
+            if (isFurnitureInBounds(dp.x, dp.y, dw, dh, room) &&
+                !collidesWithExisting(dp.x, dp.y, dw, dh, room.name, placed, "desk") &&
+                !overlapsObstruction(dp.x, dp.y, dw / 2, dh / 2, bedObstZones)) {
+              deskResult = { itemId: "desk", room: room.name, x: dp.x, y: dp.y, rotation: dp.rot as 0 | 90 | 180 | 270, scale: 0.9 };
+              break;
+            }
+          }
+        }
+        if (!deskResult) {
+          deskResult = smartPlace("desk", room, room.x + rw - 0.9, room.y + rh - 0.5, 0, 0.9, placed, bedObstZones, "desk");
+        }
+        if (deskResult) {
+          placed.push(deskResult);
+          placed.push({
+            itemId: "office-chair",
+            room: room.name,
+            x: deskResult.x,
+            y: deskResult.y - 0.5,
+            rotation: 0,
+            scale: 1.0,
+          });
+        }
       }
 
       // Plant
@@ -884,6 +936,7 @@ export function suggestFurniture(rooms: GeneratedRoom[], doors: Door[] = [], win
 
     /* ---- OFFICE / STUDY ---- */
     if (/office|study/i.test(name)) {
+      const officeObstZones = obstructionZonesByRoom.get(room.name) || [];
       placed.push({
         itemId: "desk",
         room: room.name,
@@ -900,22 +953,45 @@ export function suggestFurniture(rooms: GeneratedRoom[], doors: Door[] = [], win
         rotation: 0,
         scale: 1.0,
       });
+      // Bookshelf — wall-mounted, avoid windows/doors. Try all rotations.
       if (rw >= 2) {
-        placed.push({
-          itemId: "bookshelf",
-          room: room.name,
-          x: room.x + rw - 0.5,
-          y: room.y + rh * 0.5,
-          rotation: 90,
-          scale: 1.0,
-        });
+        let shelfResult: PlacedFurniture | null = null;
+        for (const rot of [90, 270, 0, 180]) {
+          shelfResult = wallPlace("bookshelf", room, rot as 0 | 90 | 180 | 270, 1.0, placed, officeObstZones);
+          if (shelfResult) break;
+        }
+        if (!shelfResult) {
+          for (const s of [0.85, 0.7]) {
+            for (const rot of [90, 270, 0, 180]) {
+              shelfResult = wallPlace("bookshelf", room, rot as 0 | 90 | 180 | 270, s, placed, officeObstZones);
+              if (shelfResult) break;
+            }
+            if (shelfResult) break;
+          }
+        }
+        if (!shelfResult) {
+          shelfResult = smartPlace("bookshelf", room, room.x + rw - 0.5, room.y + rh * 0.5, 90, 1.0, placed, officeObstZones, "bookshelf");
+        }
+        if (shelfResult) placed.push(shelfResult);
       }
       if (minDim >= 2) {
+        // Plant in a corner without a window/door
+        const plantItem = getFurnitureById("plant-indoor");
+        const plantHalf = plantItem ? plantItem.width / 2 : 0.2;
+        const plantCorners = [
+          { x: room.x + 0.3, y: room.y + 0.3 },
+          { x: room.x + rw - 0.3, y: room.y + 0.3 },
+          { x: room.x + 0.3, y: room.y + rh - 0.3 },
+          { x: room.x + rw - 0.3, y: room.y + rh - 0.3 },
+        ];
+        const bestCorner = plantCorners.find(c =>
+          !overlapsObstruction(c.x, c.y, plantHalf, plantHalf, officeObstZones)
+        ) || plantCorners[0];
         placed.push({
           itemId: "plant-indoor",
           room: room.name,
-          x: room.x + 0.3,
-          y: room.y + rh - 0.3,
+          x: bestCorner.x,
+          y: bestCorner.y,
           rotation: 0,
           scale: 1.0,
         });
@@ -924,25 +1000,41 @@ export function suggestFurniture(rooms: GeneratedRoom[], doors: Door[] = [], win
 
     /* ---- HALLWAY / CORRIDOR ---- */
     if (/hallway|corridor|foyer/i.test(name)) {
+      const hallObstZones = obstructionZonesByRoom.get(room.name) || [];
       if (minDim >= 1.2 && roomArea >= 4) {
+        const plantItem = getFurnitureById("plant-indoor");
+        const plantHalf = plantItem ? plantItem.width / 2 : 0.2;
+        const plantCorners = [
+          { x: rw > rh ? room.x + rw * 0.85 : cx, y: rw > rh ? cy : room.y + rh * 0.1 },
+          { x: rw > rh ? room.x + rw * 0.15 : cx, y: rw > rh ? cy : room.y + rh * 0.9 },
+        ];
+        const bestCorner = plantCorners.find(c =>
+          !overlapsObstruction(c.x, c.y, plantHalf, plantHalf, hallObstZones)
+        ) || plantCorners[0];
         placed.push({
           itemId: "plant-indoor",
           room: room.name,
-          x: rw > rh ? room.x + rw * 0.85 : cx,
-          y: rw > rh ? cy : room.y + rh * 0.1,
+          x: bestCorner.x,
+          y: bestCorner.y,
           rotation: 0,
           scale: 0.8,
         });
       }
+      // Cabinet — wall-mounted, avoid windows/doors
       if (rw >= 1.5 || rh >= 1.5) {
-        placed.push({
-          itemId: "cabinet",
-          room: room.name,
-          x: rw > rh ? room.x + rw * 0.15 : cx,
-          y: rw > rh ? cy : room.y + rh * 0.85,
-          rotation: rw > rh ? 0 : 90,
-          scale: 0.7,
-        });
+        let cabResult: PlacedFurniture | null = null;
+        const cabRot = rw > rh ? 0 : 90;
+        for (const rot of [cabRot, (cabRot + 90) % 360, (cabRot + 180) % 360, (cabRot + 270) % 360]) {
+          cabResult = wallPlace("cabinet", room, rot as 0 | 90 | 180 | 270, 0.7, placed, hallObstZones);
+          if (cabResult) break;
+        }
+        if (!cabResult) {
+          cabResult = smartPlace("cabinet", room,
+            rw > rh ? room.x + rw * 0.15 : cx,
+            rw > rh ? cy : room.y + rh * 0.85,
+            rw > rh ? 0 : 90, 0.7, placed, hallObstZones, "cabinet");
+        }
+        if (cabResult) placed.push(cabResult);
       }
     }
 
@@ -1017,6 +1109,7 @@ export function suggestFurniture(rooms: GeneratedRoom[], doors: Door[] = [], win
   const forceItems = new Set([
     "kitchen-counter-straight", "kitchen-counter-small", "stove-4-burner",
     "toilet", "sink-bathroom", "kitchen-sink", "kitchen-island",
+    "wardrobe",
     // Living room core items always appear
     "sofa-3-seater", "sofa-2-seater", "tv-unit", "rug-large",
   ]);
@@ -1045,6 +1138,7 @@ export function suggestFurniture(rooms: GeneratedRoom[], doors: Door[] = [], win
     const inObstZone = fits && !collides && overlapsObstruction(pf.x, pf.y, iw / 2, ih / 2, roomObstZones);
 
     if (fits && !collides && !inObstZone) {
+      if (pf.itemId.startsWith("bed-")) console.log(`[validate] bed in "${pf.room}" ✅ kept at wall pos (${pf.x.toFixed(2)},${pf.y.toFixed(2)}) rot=${pf.rotation}°`);
       validated.push(pf);
       continue;
     }
@@ -1055,10 +1149,10 @@ export function suggestFurniture(rooms: GeneratedRoom[], doors: Door[] = [], win
     else if (inObstZone) console.log(`[validate] ${pf.itemId} in "${pf.room}" → IN OBSTRUCTION ZONE (door/window)`);
 
     // In obstruction zone but fits otherwise — for forceItems, accept as-is
-    // for other essentials, try smartPlace; skip non-essentials
+    // for other essentials, try smartPlace; for beds, try other walls.
     if (inObstZone && fits && !collides) {
-      if (forceItems.has(pf.itemId)) {
-        // Core item: keep it even in a door zone — placement was already optimized
+      if (forceItems.has(pf.itemId) || pf.itemId.startsWith("bed-")) {
+        // Core item or bed: keep it — beds must stay against walls
         validated.push(pf);
         continue;
       }
@@ -1073,7 +1167,29 @@ export function suggestFurniture(rooms: GeneratedRoom[], doors: Door[] = [], win
       continue;
     }
 
-    // Doesn't fit — try smartPlace for essentials (tries smaller scales too)
+    // Doesn't fit — for beds, keep the wall position at reduced scale.
+    // NEVER move a bed to a different wall or to room center.
+    if (pf.itemId.startsWith("bed-")) {
+      // Try reduced scale at the same position first
+      for (const s of [pf.scale * 0.9, pf.scale * 0.8, pf.scale * 0.7, pf.scale * 0.6]) {
+        const isRot = pf.rotation === 90 || pf.rotation === 270;
+        const iw2 = (isRot ? item.height : item.width) * s;
+        const ih2 = (isRot ? item.width : item.height) * s;
+        if (isFurnitureInBounds(pf.x, pf.y, iw2, ih2, room) &&
+            !collidesWithExisting(pf.x, pf.y, iw2, ih2, pf.room, validated, pf.itemId)) {
+          console.log(`[validate] bed in "${pf.room}" ⚠️ scaled to ${s.toFixed(2)} at wall pos (${pf.x.toFixed(2)},${pf.y.toFixed(2)})`);
+          validated.push({ ...pf, scale: s });
+          break;
+        }
+      }
+      // If even reduced fails, push it anyway — bed against wall > no bed
+      if (!validated.some(v => v.itemId === pf.itemId && v.room === pf.room)) {
+        console.log(`[validate] bed in "${pf.room}" ⚠️ forcing wall pos despite issues`);
+        validated.push(pf);
+      }
+      continue;
+    }
+
     if (essentialIds.has(pf.itemId)) {
       const fixed = smartPlace(pf.itemId, room, pf.x, pf.y, pf.rotation, pf.scale, validated, roomObstZones);
       if (fixed) {

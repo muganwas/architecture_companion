@@ -60,13 +60,16 @@ export function computeLayout(plan: AbstractPlan, options?: LayoutOptions): Layo
     totalArea = 500;
   }
 
-  // ── Step 0: Fixed column widths — rooms fill columns completely ──
-  // Building shape is determined by rooms, not vice versa
+  // ── Step 0: Scale column widths with total area for squarer rooms ──
+  // Fixed columns work for ~150m² but produce tall/thin rooms at larger areas.
+  // Scale colWidth proportionally to sqrt(area), capped for realistic sizing.
   const hallwayWidth = 1.2;
-  const colWidth = 5.5; // fixed column width for consistent room sizing
-  const buildingW = colWidth * 2 + hallwayWidth; // ~12.2m
+  const colWidth = Math.max(5.0, Math.min(8.0, (Math.sqrt(totalArea) - hallwayWidth) / 2));
+  const buildingW = colWidth * 2 + hallwayWidth;
   const buildingH = totalArea / buildingW;
   const polyBounds = { x: 0, y: 0, w: buildingW, h: buildingH };
+
+  console.log(`[layout] area=${totalArea}m² colWidth=${colWidth.toFixed(1)}m building=${buildingW.toFixed(1)}×${buildingH.toFixed(1)}m ratio=${(buildingW/buildingH).toFixed(2)}`);
 
   // Normalize ratios to sum to 1.0 (exclude hallway, porch, balcony from ratio calc)
   const interiorRatios: Record<string, number> = {};
@@ -1044,12 +1047,32 @@ function carveEnsuiteFromMaster(
   const finalH = Math.min(ensuiteH, master.height - bedZoneH);
   const finalArea = finalW * finalH;
 
-  // Place ensuite in exterior corner (away from hallway), at the bottom of master
-  const isLeftColumn = master.x < hallway.x + hallway.width / 2;
-  const ensuiteX = isLeftColumn
-    ? master.x // exterior = left side
-    : master.x + master.width - finalW; // exterior = right side
-  const ensuiteY = master.y + master.height - finalH; // bottom of master
+  // Place ensuite in a CORNER of the master — touches two walls.
+  // Prefer a corner where both walls are exterior (window on two sides).
+  // Fall back to any exterior-wall corner, then any corner.
+  const ext = {
+    top:    isExteriorWall(master, "top", rooms),
+    bottom: isExteriorWall(master, "bottom", rooms),
+    left:   isExteriorWall(master, "left", rooms),
+    right:  isExteriorWall(master, "right", rooms),
+  };
+
+  // Corner definitions: [corner name, x-offset, y-offset, wall1, wall2]
+  const corners: Array<{ label: string; x: number; y: number; extCount: number }> = [
+    { label: "top-left",     x: master.x,                          y: master.y,                          extCount: (ext.top ? 1 : 0) + (ext.left ? 1 : 0) },
+    { label: "top-right",    x: master.x + master.width - finalW,  y: master.y,                          extCount: (ext.top ? 1 : 0) + (ext.right ? 1 : 0) },
+    { label: "bottom-left",  x: master.x,                          y: master.y + master.height - finalH, extCount: (ext.bottom ? 1 : 0) + (ext.left ? 1 : 0) },
+    { label: "bottom-right", x: master.x + master.width - finalW,  y: master.y + master.height - finalH, extCount: (ext.bottom ? 1 : 0) + (ext.right ? 1 : 0) },
+  ];
+
+  // Sort by exterior wall count (descending), pick the best corner
+  corners.sort((a, b) => b.extCount - a.extCount);
+  const best = corners[0];
+
+  const ensuiteX = best.x;
+  const ensuiteY = best.y;
+
+  console.log(`[ensuite] corner="${best.label}" extWalls=${best.extCount} (top=${ext.top} bottom=${ext.bottom} left=${ext.left} right=${ext.right})`);
 
   rooms.push({
     name: "Ensuite",
@@ -1517,53 +1540,28 @@ function generateDoors(rooms: GeneratedRoom[], skipWalls?: Set<string>, kitchenL
 
     // Standard room: door to hallway
     // Ensuite connects to master bedroom, not hallway.
-    // The ensuite is carved inside the master, so edges don't touch exactly —
-    // we find the interior-facing wall and place the door there.
+    // The ensuite is carved inside the master, so we place the door on the
+    // wall OPPOSITE the exterior wall it sits against (faces the bedroom).
     if (/ensuite/i.test(room.name)) {
       const master = rooms.find(r => /master/i.test(r.name));
       if (master) {
-        // Compute building extents from INTERIOR rooms only (exclude porches/balconies
-        // which extend beyond the building and would skew the exterior-wall detection)
-        let maxX = 0, maxY = 0;
-        for (const r of rooms) {
-          if (/porch|balcony/i.test(r.name)) continue;
-          if (r.x + r.width > maxX) maxX = r.x + r.width;
-          if (r.y + r.height > maxY) maxY = r.y + r.height;
-        }
-        const EXT_TOL = 0.1;
+        // Find which wall of the ensuite is exterior — the door goes opposite
+        const extWall = findExteriorWall(room, rooms);
+        const doorWall = oppositeWall(extWall);
 
-        // Find an interior wall (not on building perimeter) for the door
-        const interiorWalls: Door["wall"][] = [];
-        if (!(Math.abs(room.x) < EXT_TOL)) interiorWalls.push("left");
-        if (!(Math.abs(room.x + room.width - maxX) < EXT_TOL)) interiorWalls.push("right");
-        if (!(Math.abs(room.y) < EXT_TOL)) interiorWalls.push("bottom");
-        if (!(Math.abs(room.y + room.height - maxY) < EXT_TOL)) interiorWalls.push("top");
+        const wallLen = doorWall === "left" || doorWall === "right" ? room.height : room.width;
+        const doorWidth = 0.75;
+        const doorOffset = Math.max(doorWidth / 2 + 0.15, Math.min(wallLen - doorWidth / 2 - 0.15, wallLen * 0.5));
 
-        // Prefer top wall (faces main bedroom area), then any interior wall
-        const wall: Door["wall"] | null =
-          interiorWalls.includes("top") ? "top" :
-          interiorWalls.includes("bottom") ? "bottom" :
-          interiorWalls.includes("left") ? "left" :
-          interiorWalls.includes("right") ? "right" :
-          null;
-
-        if (wall) {
-          const wallLen = wall === "left" || wall === "right" ? room.height : room.width;
-          const doorWidth = 0.75;
-          const doorOffset = Math.max(doorWidth / 2 + 0.15, Math.min(wallLen - doorWidth / 2 - 0.15, wallLen * 0.5));
-
-          doors.push({
-            room: room.name,
-            wall,
-            offset: doorOffset,
-            width: doorWidth,
-            swing: "in",
-          });
-          // Note: no master-side door — the ensuite is carved inside the master,
-          // so the ensuite door alone shows the access point. A master-side door
-          // would be placed on an exterior wall (oppositeWall of an interior wall
-          // = exterior), creating a phantom door to the outside.
-        }
+        doors.push({
+          room: room.name,
+          wall: doorWall,
+          offset: doorOffset,
+          width: doorWidth,
+          swing: "in",
+        });
+        // Note: no master-side door — the ensuite is carved inside the master,
+        // so the ensuite door alone shows the access point.
       }
       continue;
     }

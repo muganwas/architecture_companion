@@ -388,9 +388,11 @@ export default function FloorPlanCanvas({
 
     const scaleW = item.width * pf.scale * s;
     const scaleH = item.height * pf.scale * s;
-    const isRot = pf.rotation === 90 || pf.rotation === 270;
-    const rw = isRot ? scaleH : scaleW;
-    const rh = isRot ? scaleW : scaleH;
+    // Konva's rotation prop handles visual orientation — DO NOT swap dimensions.
+    // Swapping would invert the item: the long side would stick into the room
+    // instead of running along the wall for rot=90/270 placements.
+    const rw = scaleW;
+    const rh = scaleH;
     const pos = toCanvas(pf.x, pf.y, s, bb);
 
     const cat = item.category;
@@ -528,8 +530,8 @@ export default function FloorPlanCanvas({
 
         {/* ============ BED (top-down) ============ */}
         {(pf.itemId === "bed-single" || pf.itemId === "bed-double" || pf.itemId === "bed-queen" || pf.itemId === "bed-king") && (() => {
-          // Headboard is always on the shorter side (item.width < item.height for all beds)
-          // After rotation: rw = rendered width, rh = rendered height
+          // Beds are always placed at rot=0, so rw = item.width (across),
+          // rh = item.height (head-to-foot). Headboard is on the shorter side (width).
           const isRotatedHead = rw > rh; // headboard should be on the shorter dimension
           const hbW = isRotatedHead ? rh : rw;
           const hbH = isRotatedHead ? rw : rh;
