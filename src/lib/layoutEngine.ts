@@ -188,7 +188,7 @@ export function computeLayout(plan: AbstractPlan, options?: LayoutOptions): Layo
       }
 
       // ── Minimum room sizes by type ──
-      const minArea = getMinRoomArea(name);
+      const minArea = getMinRoomArea(name, totalArea);
       const minW = getMinRoomWidth(name);
       roomW = Math.max(roomW, minW, minRoomWidth);
       roomH = Math.max(roomH, 2.0);
@@ -286,6 +286,10 @@ export function computeLayout(plan: AbstractPlan, options?: LayoutOptions): Layo
     }
   }
 
+  // ── Balance columns: ensure rooms are distributed across both sides ──
+  // Prevents scenarios where all rooms pile up on one side of the hallway.
+  balanceColumns(zones);
+
   // Place left column rooms — front→back: front rooms at bottom (y=0), back rooms at top
   // Porch and Balcony are exterior extensions only, never regular rooms
   const isNotExtension = (n: string) => !/porch|balcony/i.test(n);
@@ -315,17 +319,22 @@ export function computeLayout(plan: AbstractPlan, options?: LayoutOptions): Layo
   hallway.height = maxEndY - polyBounds.y;
   hallway.area = parseFloat((hallway.width * hallway.height).toFixed(1));
 
-  // ── Post-processing: enforce zero-gap adjacency FIRST ──
+  // ── Post-processing: enforce master bedroom dominance FIRST ──
+  // Must run before zero-gap so any space freed by capping non-master bedrooms
+  // gets redistributed to fill the column.
+  enforceMasterDominance(rooms);
+
+  // ── Post-processing: enforce zero-gap adjacency ──
   // Every column room must span full column width and stack flush.
-  // Must run before ensuite carving so the ensuite is placed inside the master's final position.
-  enforceZeroGapAdjacency(rooms, leftZoneX, leftZoneWidth, polyBounds.y, leftEndY, totalArea);
-  enforceZeroGapAdjacency(rooms, rightZoneX, rightZoneWidth, polyBounds.y, rightEndY, totalArea);
+  // Use maxEndY (tallest column) for both sides so the shorter column
+  // stretches its rooms to fill the hallway height — no dead space.
+  enforceZeroGapAdjacency(rooms, leftZoneX, leftZoneWidth, polyBounds.y, maxEndY, totalArea);
+  enforceZeroGapAdjacency(rooms, rightZoneX, rightZoneWidth, polyBounds.y, maxEndY, totalArea);
 
   // ── Post-processing: carve ensuite from master bedroom ──
-  carveEnsuiteFromMaster(rooms, hallway);
-
-  // ── Post-processing: enforce master bedroom dominance ──
-  enforceMasterDominance(rooms);
+  // Only carve if the LLM's abstract plan explicitly includes an Ensuite.
+  // Prevents adding a 2nd bathroom when the user only asked for 1.
+  carveEnsuiteFromMaster(rooms, hallway, zones);
 
   // Step 4: Building polygon is decorative outline only — do NOT clip rooms.
   // Clipping destroys usable room area and creates gaps between rooms.
@@ -645,19 +654,21 @@ function polygonArea(vertices: Array<{ x: number; y: number }>): number {
   return Math.abs(area) / 2;
 }
 
-/** Get minimum area (m²) for a room type */
-function getMinRoomArea(name: string): number {
+/** Get minimum area (m²) for a room type — scales with total building area */
+function getMinRoomArea(name: string, totalArea?: number): number {
   const n = name.toLowerCase();
-  if (/garage/i.test(n)) return 14;
-  if (/living|lounge|family/i.test(n)) return 14;
-  if (/master/i.test(n)) return 12;
-  if (/bedroom/i.test(n)) return 9;
-  if (/kitchen/i.test(n)) return 6;
-  if (/dining/i.test(n)) return 8;
-  if (/bathroom|ensuite/i.test(n)) return 3.5;
-  if (/office|study/i.test(n)) return 6;
-  if (/laundry/i.test(n)) return 4;
-  return 4;
+
+  // Ratio-based floor: room should be at least X% of total area
+  if (/garage/i.test(n)) return Math.max(14, totalArea ? totalArea * 0.10 : 14);
+  if (/living|lounge|family/i.test(n)) return Math.max(14, totalArea ? totalArea * 0.12 : 14);
+  if (/master/i.test(n)) return Math.max(12, totalArea ? totalArea * 0.09 : 12);
+  if (/bedroom/i.test(n)) return Math.max(9, totalArea ? totalArea * 0.07 : 9);
+  if (/kitchen/i.test(n)) return Math.max(8, totalArea ? totalArea * 0.06 : 8);
+  if (/dining/i.test(n)) return Math.max(8, totalArea ? totalArea * 0.06 : 8);
+  if (/bathroom|ensuite/i.test(n)) return Math.max(4, totalArea ? totalArea * 0.025 : 4);
+  if (/office|study/i.test(n)) return Math.max(7, totalArea ? totalArea * 0.05 : 7);
+  if (/laundry/i.test(n)) return Math.max(4, totalArea ? totalArea * 0.03 : 4);
+  return Math.max(4, totalArea ? totalArea * 0.03 : 4);
 }
 
 /** Get minimum width (m) for a room type */
@@ -672,23 +683,19 @@ function getMinRoomWidth(name: string): number {
   return 2.0;
 }
 
-/** Get maximum area (m²) for a room type — scales with total building area */
+/** Get maximum area (m²) for a room type — only bathrooms/ensuites/laundry are capped.
+ *  Living spaces grow freely with total area via the LLM's ratios. */
 function getMaxRoomArea(name: string, totalArea: number): number {
   const n = name.toLowerCase();
-  // Base max for a ~150m² house; scale up proportionally for larger buildings
-  const baseScale = Math.min(totalArea / 150, 3.0); // cap at 3x for sanity
-  const s = Math.max(baseScale, 0.7); // floor at 0.7x for very small houses
+  const scale = Math.max(totalArea / 150, 0.7);
 
-  if (/ensuite/i.test(n)) return Math.round(5 * s);
-  if (/bathroom/i.test(n)) return Math.round(8 * s);
-  if (/laundry/i.test(n)) return Math.round(6 * s);
-  if (/office|study/i.test(n)) return Math.round(12 * s);
-  if (/bedroom/i.test(n) && !/master/i.test(n)) return Math.round(18 * s);
-  if (/master/i.test(n)) return Math.round(28 * s);
-  if (/living|lounge|family/i.test(n)) return Math.round(32 * s);
-  if (/kitchen/i.test(n)) return Math.round(20 * s);
-  if (/dining/i.test(n)) return Math.round(16 * s);
-  return 999; // garage, hallway, etc. — no cap
+  // Only cap sanitary/utility rooms — living spaces fill available area
+  if (/ensuite/i.test(n)) return Math.round(10 * scale);   // was 5 — raised 2x
+  if (/bathroom/i.test(n)) return Math.round(14 * scale);  // was 8 — raised 75%
+  if (/laundry/i.test(n)) return Math.round(10 * scale);   // was 6 — raised 67%
+
+  // Everything else: no hard cap — ratios determine size
+  return 999;
 }
 
 /**
@@ -894,26 +901,89 @@ function enforceKitchenGarageAdjacency(
 }
 
 /**
+ * Balance room distribution across the left and right columns.
+ * Triggers when one column is empty (0 vs 2+) OR when one column has
+ * only 1 room while the other has 3+ (e.g., bathroom stranded alone).
+ */
+function balanceColumns(
+  zones: Record<string, string[]>
+): void {
+  const leftZones = ["frontLeft", "leftMiddle", "backLeft"];
+  const rightZones = ["frontRight", "rightMiddle", "backRight"];
+  const zoneMap: Record<string, string> = {
+    frontRight: "frontLeft", rightMiddle: "leftMiddle", backRight: "backLeft",
+    frontLeft: "frontRight", leftMiddle: "rightMiddle", backLeft: "backRight",
+  };
+
+  const isNotExtension = (n: string) => !/porch|balcony/i.test(n);
+
+  const leftRooms = leftZones.flatMap(k => (zones[k] || []).filter(isNotExtension));
+  const rightRooms = rightZones.flatMap(k => (zones[k] || []).filter(isNotExtension));
+
+  // Balance when one column has 2+ fewer rooms than the other.
+  // E.g. 3 vs 1, 4 vs 2, 3 vs 0 — prevents lopsided layouts where
+  // one side is underfilled while the other has crowding.
+  const needsBalance = leftRooms.length <= rightRooms.length - 2
+                    || rightRooms.length <= leftRooms.length - 2;
+
+  if (!needsBalance) return;
+
+  // Move from fuller → sparser side. Move 1 room for lone-side case, half for empty-side.
+  const fromRight = rightRooms.length > leftRooms.length;
+  const moveCount = Math.min(
+    fromRight ? rightRooms.length - 1 : leftRooms.length - 1, // leave at least 1
+    Math.max(1, Math.floor(Math.max(leftRooms.length, rightRooms.length) / 2))
+  );
+
+  const fromZoneNames = fromRight ? [...rightZones].reverse() : [...leftZones].reverse();
+
+  // Collect rooms to move, tracking their source zone
+  const toMove: Array<{ name: string; fromZone: string }> = [];
+  for (const k of fromZoneNames) {
+    const arr = zones[k];
+    if (!arr) continue;
+    for (let i = arr.length - 1; i >= 0 && toMove.length < moveCount; i--) {
+      if (isNotExtension(arr[i]) && !/garage/i.test(arr[i])) {
+        toMove.push({ name: arr[i], fromZone: k });
+        arr.splice(i, 1);
+      }
+    }
+  }
+
+  // Place moved rooms in corresponding zones on the target side
+  for (const { name, fromZone } of toMove) {
+    const destKey = zoneMap[fromZone];
+    if (!destKey) continue;
+    if (!zones[destKey]) zones[destKey] = [];
+    zones[destKey]!.push(name);
+  }
+
+  console.log(`[balance] moved ${toMove.length} rooms from ${fromRight ? "right" : "left"} → ${fromRight ? "left" : "right"} column (${Math.max(leftRooms.length, rightRooms.length)} vs ${Math.min(leftRooms.length, rightRooms.length)})`);
+}
+
+/**
  * Ensure the master bedroom is the largest bedroom in the house.
- * If a non-master bedroom is larger, cap it to 90% of master's area.
+ * Instead of shrinking non-master bedrooms (which creates gaps),
+ * grow the master to be at least 10% larger than any competitor.
  */
 function enforceMasterDominance(rooms: GeneratedRoom[]): void {
   const master = rooms.find(r => /master/i.test(r.name));
   if (!master) return;
 
+  let largestNonMaster = 0;
   for (const room of rooms) {
     if (room === master) continue;
     if (!/bedroom/i.test(room.name)) continue;
     if (/bathroom/i.test(room.name)) continue;
+    if (room.area > largestNonMaster) largestNonMaster = room.area;
+  }
 
-    // Cap non-master bedroom to at most 90% of master area
-    const maxArea = master.area * 0.9;
-    if (room.area > maxArea) {
-      // Reduce height to cap the area
-      const scale = Math.sqrt(maxArea / room.area);
-      room.height = parseFloat((room.height * scale).toFixed(2));
-      room.area = parseFloat((room.width * room.height).toFixed(1));
-    }
+  // If a non-master is larger, grow the master to be 10% bigger
+  if (largestNonMaster > master.area) {
+    const targetArea = largestNonMaster * 1.1;
+    master.height = parseFloat((targetArea / master.width).toFixed(2));
+    master.area = parseFloat(targetArea.toFixed(1));
+    console.log(`[master-dominance] grew master to ${master.area.toFixed(1)}m² (was smaller than ${largestNonMaster.toFixed(1)}m² non-master)`);
   }
 }
 
@@ -921,42 +991,78 @@ function enforceMasterDominance(rooms: GeneratedRoom[]): void {
  * Place ensuite INSIDE the master bedroom — a sub-room within master's boundaries.
  * The master keeps its full area; the ensuite is a private bathroom in one corner.
  */
-function carveEnsuiteFromMaster(rooms: GeneratedRoom[], hallway: GeneratedRoom): void {
+function carveEnsuiteFromMaster(
+  rooms: GeneratedRoom[],
+  hallway: GeneratedRoom,
+  zones?: Record<string, string[]>
+): void {
   const master = rooms.find(r => /master/i.test(r.name));
   if (!master) return;
-
-  // Don't create ensuite if master is too small (needs space for bed + ensuite)
-  if (master.area < 14) return;
 
   // Don't carve if there's already an ensuite in the rooms
   if (rooms.some(r => /ensuite/i.test(r.name))) return;
 
-  // Scale ensuite size to master bedroom: smaller master → smaller ensuite
-  const scale = master.area < 18 ? 0.8 : master.area < 24 ? 0.9 : 1.0;
-  const ensuiteW = 1.8 * scale;
-  const ensuiteH = 2.2 * scale;
-  const ensuiteArea = ensuiteW * ensuiteH; // 5.0m²
+  // Only carve if the LLM's abstract plan explicitly included "Ensuite" in a zone
+  // AND there are 2+ bathrooms total. A single bathroom must be hallway-accessible.
+  if (zones) {
+    const allZoneNames = Object.values(zones).flat().filter(Boolean) as string[];
+    const hasEnsuiteInPlan = allZoneNames.some((n) => /ensuite/i.test(n));
+    const bathCount = allZoneNames.filter((n) => /bathroom|ensuite|powder|wc/i.test(n)).length;
+    if (!hasEnsuiteInPlan || bathCount < 2) return;
+  }
 
-  // Safety: ensuite must fit inside master
-  if (ensuiteW > master.width - 0.5 || ensuiteH > master.height - 1.0) return;
+  // ── Minimum functional ensuite: must fit toilet, sink, and shower ──
+  const MIN_ENSUITE_AREA = 5.5;  // m² — toilet (0.45×0.7) + sink (0.6×0.5) + shower (0.9×0.9) + circulation
+  const MIN_ENSUITE_W = 1.8;     // m
+  const MIN_ENSUITE_H = 2.5;     // m
+
+  // Master must have enough room for a bed (3m² min) plus the ensuite
+  const bedZoneH = 2.0; // minimum height along the opposite wall for a bed
+  if (master.height < MIN_ENSUITE_H + bedZoneH || master.width < MIN_ENSUITE_W + 0.5) {
+    console.warn(`[ensuite] ⚠️ master (${master.width.toFixed(1)}×${master.height.toFixed(1)}m) too small for functional ensuite — skipping.`);
+    return;
+  }
+
+  // Scale ensuite proportionally to master size. Minimum ensures all fixtures fit.
+  const ensuiteArea = Math.max(MIN_ENSUITE_AREA, master.area * 0.15);
+  const maxWidth = master.width * 0.45;
+  const ensuiteW = Math.min(maxWidth, Math.max(MIN_ENSUITE_W, Math.sqrt(ensuiteArea * 0.75)));
+  const ensuiteH = Math.max(MIN_ENSUITE_H, ensuiteArea / ensuiteW);
+
+  // Final safety: ensuite must fit inside master leaving room for the bed
+  if (ensuiteH > master.height - bedZoneH || ensuiteW > master.width - 0.5) {
+    // Try the minimum functional size as a last resort
+    if (MIN_ENSUITE_H <= master.height - bedZoneH && MIN_ENSUITE_W <= master.width - 0.5) {
+      console.log(`[ensuite] scaled size (${ensuiteW.toFixed(1)}×${ensuiteH.toFixed(1)}m) doesn't fit — using minimum functional ${MIN_ENSUITE_W}×${MIN_ENSUITE_H}m`);
+    } else {
+      console.warn(`[ensuite] ⚠️ even minimum functional ensuite (${MIN_ENSUITE_W}×${MIN_ENSUITE_H}m) won't fit in master (${master.width.toFixed(1)}×${master.height.toFixed(1)}m) — skipping.`);
+      return;
+    }
+  }
+
+  const finalW = Math.min(ensuiteW, master.width - 0.5);
+  const finalH = Math.min(ensuiteH, master.height - bedZoneH);
+  const finalArea = finalW * finalH;
 
   // Place ensuite in exterior corner (away from hallway), at the bottom of master
   const isLeftColumn = master.x < hallway.x + hallway.width / 2;
   const ensuiteX = isLeftColumn
     ? master.x // exterior = left side
-    : master.x + master.width - ensuiteW; // exterior = right side
-  const ensuiteY = master.y + master.height - ensuiteH; // bottom of master
+    : master.x + master.width - finalW; // exterior = right side
+  const ensuiteY = master.y + master.height - finalH; // bottom of master
 
-  // Master keeps its full area — ensuite is inside it
-  // Create ensuite room (rendered on top of master in the canvas)
   rooms.push({
     name: "Ensuite",
     x: ensuiteX,
     y: ensuiteY,
-    width: ensuiteW,
-    height: ensuiteH,
-    area: parseFloat(ensuiteArea.toFixed(1)),
+    width: parseFloat(finalW.toFixed(2)),
+    height: parseFloat(finalH.toFixed(2)),
+    area: parseFloat(finalArea.toFixed(1)),
   });
+
+  if (finalArea < 6) {
+    console.log(`[ensuite] compact ${finalArea.toFixed(1)}m² (${finalW.toFixed(1)}×${finalH.toFixed(1)}m) — minimum functional size.`);
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -1133,20 +1239,28 @@ function createSmartExtension(
   // Find the host room, skipping already-used hosts for balconies
   let hostRoom: GeneratedRoom | undefined;
   if (isBalcony) {
-    // Priority: living room → master → any bedroom, but prefer unused rooms
+    // Priority: living room → master → any bedroom → kitchen → any room on exterior
     hostRoom = rooms.find(r => /living|lounge|family/i.test(r.name) && !usedHosts.has(r.name))
             || rooms.find(r => /master/i.test(r.name) && !usedHosts.has(r.name))
             || rooms.find(r => /bedroom/i.test(r.name) && !usedHosts.has(r.name))
             // Fall back to any room even if already used
             || rooms.find(r => /living|lounge|family/i.test(r.name))
             || rooms.find(r => /master/i.test(r.name))
-            || rooms.find(r => /bedroom/i.test(r.name));
+            || rooms.find(r => /bedroom/i.test(r.name))
+            // Ultimate fallback: any non-hallway, non-extension room
+            || rooms.find(r => /kitchen/i.test(r.name))
+            || rooms.find(r => !/hallway|porch|balcony/i.test(r.name));
   } else if (isPorch) {
     hostRoom = rooms.find(r => /living|lounge/i.test(r.name))
-            || rooms.find(r => /kitchen/i.test(r.name));
+            || rooms.find(r => /kitchen/i.test(r.name))
+            // Fallback: any room at the front
+            || rooms.find(r => !/hallway|porch|balcony/i.test(r.name));
   }
 
-  if (!hostRoom) return null;
+  if (!hostRoom) {
+    console.warn(`[extension] ⚠️ no host room found for "${name}" — skipping.`);
+    return null;
+  }
 
   // Track which host was used (for multiple balcony support)
   usedHosts.add(hostRoom.name);

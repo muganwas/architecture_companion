@@ -848,11 +848,13 @@ export function suggestFurniture(rooms: GeneratedRoom[], doors: Door[] = [], win
         scale: 1.0,
       });
 
-      // Sink — opposite side from toilet
+      // Sink — centred on the opposite wall from toilet, well clear of door zones.
+      // For tiny ensuites, push it to the middle of the wall to avoid window/door edges.
+      const sinkX = roomArea < 5 ? room.x + rw * 0.5 : room.x + rw * 0.78;
       placed.push({
         itemId: "sink-bathroom",
         room: room.name,
-        x: room.x + rw * 0.78,
+        x: sinkX,
         y: room.y + rh * 0.2,
         rotation: 0,
         scale: 1.0,
@@ -1014,7 +1016,7 @@ export function suggestFurniture(rooms: GeneratedRoom[], doors: Door[] = [], win
   // Items that MUST appear — if smartPlace fails, compute fitting scale
   const forceItems = new Set([
     "kitchen-counter-straight", "kitchen-counter-small", "stove-4-burner",
-    "toilet", "kitchen-sink", "kitchen-island",
+    "toilet", "sink-bathroom", "kitchen-sink", "kitchen-island",
     // Living room core items always appear
     "sofa-3-seater", "sofa-2-seater", "tv-unit", "rug-large",
   ]);

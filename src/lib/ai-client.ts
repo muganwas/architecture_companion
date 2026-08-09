@@ -140,7 +140,7 @@ async function callOpenAI(
         {
           role: "system",
           content:
-            `You are an architectural planner. Output valid JSON only, no markdown.\n\nReturn this abstract plan format (the layout engine computes coordinates):\n${ABSTRACT_PLAN_FORMAT}\n\nCRITICAL RULES:\n- totalArea MUST be at least 60m². A 2-bedroom house needs at least 80m², 3-bedroom at least 100m². Never return less than 60m².\n- Only include rooms the user explicitly asked for. Do NOT invent rooms (no auto-dining, no auto-guest).\n- If the user asks for N bedrooms, you MUST include exactly N bedrooms (Master Bedroom counts as 1). Count and verify.\n- If the user asks for N bathrooms, Ensuite COUNTS as a bathroom. So "2 bathrooms" with a master = 1 Ensuite + 1 Bathroom. NEVER create duplicate room names.\n- If user asks for a garage, you MUST include it in frontLeft or frontRight zone. It is required, not optional.\n- Master bedroom must always be in backLeft or backRight zone.\n- Living room must be in frontLeft or frontRight (it's the face of the house).\n- No single room should exceed 22% of totalArea. Living room and garage are largest at 18-22%.\n\nDETAILED RULES:\n- totalArea in m². Convert sq ft (÷10.764). If user specifies sq ft, convert to m².\n- hallwaySide: "center", "left", or "right".\n- zones: room names by column. Available slots: frontLeft, leftMiddle, backLeft, frontRight, rightMiddle, backRight.\n- roomRatios: fraction of totalArea for each room. Sum to 1.0 (excl. extensions).\n  Smallest (2-5%): Bathroom, Ensuite, Porch.\n  Medium (8-14%): Bedrooms, Kitchen.\n  Largest (16-22%): Living Room, Garage. Living Room always largest.\n  1 bath → in any back zone. 2 baths (including ensuite) → spread across different zones.\n  Ensuite ONLY with Master Bedroom in same zone.\n- exteriorExtensions: Porch=front, Balcony=right/left/back.\n- If user requested dining, place Kitchen + Dining on same side.\n- If user requested garage, place in frontLeft or frontRight. Garage MUST be included if asked.\n- roomShapes (optional): "rectangle", "l-shape", "bay-window", "angled-corner".`,
+            `You are an architectural planner. Output valid JSON only, no markdown.\n\nReturn this abstract plan format (the layout engine computes coordinates):\n${ABSTRACT_PLAN_FORMAT}\n\nCRITICAL RULES:\n- totalArea MUST be at least 60m². A 2-bedroom house needs at least 80m², 3-bedroom at least 100m². Never return less than 60m².\n- totalArea is INTERIOR floor area ONLY. Balconies, porches, and verandas are exterior extensions that sit OUTSIDE the building — they do NOT count toward totalArea. They go in exteriorExtensions.\n- Only include rooms the user explicitly asked for. Do NOT invent rooms (no auto-dining, no auto-guest).\n- If the user asks for N bedrooms, you MUST include exactly N bedrooms (Master Bedroom counts as 1). Count and verify.\n- If the user asks for N bathrooms, Ensuite COUNTS as a bathroom. "1 bathroom" → ALWAYS a standalone Bathroom (never Ensuite — it must be accessible to everyone). "2+ bathrooms" + master → 1 Ensuite + remaining Bathroom(s). Count and verify. NEVER create duplicate room names.\n- If user asks for a garage, you MUST include it in frontLeft or frontRight zone. It is required, not optional.\n- Master bedroom must always be in backLeft or backRight zone.\n- Living room must be in frontLeft or frontRight (it's the face of the house).\n- No single room should exceed 22% of totalArea. Living room and garage are largest at 18-22%.\n\nDETAILED RULES:\n- totalArea in m². Convert sq ft (÷10.764). If user specifies sq ft, convert to m².\n- hallwaySide: "center", "left", or "right".\n- zones: room names by column. Available slots: frontLeft, leftMiddle, backLeft, frontRight, rightMiddle, backRight.\n- roomRatios: fraction of totalArea for each room. Sum to 1.0 (excl. extensions).\n  Smallest (2-5%): Bathroom, Ensuite, Porch.\n  Medium (8-14%): Bedrooms, Kitchen.\n  Largest (16-22%): Living Room, Garage. Living Room always largest.\n  1 bath → always standalone Bathroom in a back zone (never Ensuite — must be hallway-accessible). 2+ baths → 1 Ensuite (with master) + remaining Bathroom(s) spread across different zones.\n  Ensuite ONLY with Master Bedroom in same zone.\n- exteriorExtensions: Porch=front, Balcony=right/left/back. These are EXTRA space outside the building — their area is NOT part of totalArea.\n- If user requested dining, place Kitchen + Dining on same side.\n- If user requested garage, place in frontLeft or frontRight. Garage MUST be included if asked.\n- roomShapes (optional): "rectangle", "l-shape", "bay-window", "angled-corner".`,
         },
         { role: "user", content: prompt },
       ],
@@ -193,11 +193,16 @@ export async function generateFloorPlan(
     // Validate: check which requested rooms couldn't fit
     const warnings = validateRoomPlacement(input.description, parsed as AbstractPlan, layout.rooms);
 
+    // Total area: interior rooms only (exclude hallway, porch, balcony — extensions are extra)
+    const interiorArea = layout.rooms
+      .filter(r => !/hallway|porch|balcony/i.test(r.name))
+      .reduce((s, r) => s + r.area, 0);
+
     return {
       rooms: layout.rooms,
       doors: layout.doors,
       windows: layout.windows,
-      totalArea: layout.rooms.reduce((s, r) => s + r.area, 0),
+      totalArea: parseFloat(interiorArea.toFixed(1)),
       sustainabilityScore: parsed.sustainabilityScore || { light: 0.7, ventilation: 0.7, energy: 0.7, overall: 0.7 },
       costEstimate: parsed.costEstimate || { low: 50000, high: 80000, currency: "USD" },
       placedFurniture: furniture,
@@ -257,6 +262,11 @@ function validateRoomPlacement(
   }
 
   // ── 1. Detect rooms the USER explicitly asked for ──
+  // Porches, verandas, and balconies are exterior extensions — they sit OUTSIDE
+  // the building footprint and don't consume interior area. Don't show
+  // user-facing "couldn't fit" warnings for them.
+  const exteriorPattern = /porch|veranda|terrace|balcony/i;
+
   const userRequested: Array<{ keyword: RegExp; label: string }> = [
     { keyword: /garage|carport|parking/i, label: "Garage / Parking" },
     { keyword: /dining|dinner/i, label: "Dining room" },
@@ -264,8 +274,6 @@ function validateRoomPlacement(
     { keyword: /laundry|utility|wash room/i, label: "Laundry / Utility room" },
     { keyword: /ensuite|en-suite|master bath/i, label: "Ensuite bathroom" },
     { keyword: /walk-in|walk in|closet|wardrobe/i, label: "Walk-in closet" },
-    { keyword: /porch|veranda|terrace/i, label: "Porch / Veranda" },
-    { keyword: /balcony/i, label: "Balcony" },
     { keyword: /guest/i, label: "Guest room" },
     { keyword: /pantry|storage/i, label: "Pantry / Storage" },
   ];
@@ -281,6 +289,14 @@ function validateRoomPlacement(
           `Try increasing the total area or reducing other rooms.`
         );
       }
+    }
+  }
+
+  // ── 1a. Check porches/balconies (exterior extensions, not interior rooms) ──
+  if (exteriorPattern.test(desc)) {
+    const found = placedLower.some(name => exteriorPattern.test(name));
+    if (!found) {
+      console.log(`[validate] user asked for porch/balcony but none was placed — extension may have had no suitable host`);
     }
   }
 
