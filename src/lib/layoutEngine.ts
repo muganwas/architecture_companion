@@ -198,7 +198,7 @@ export function computeLayout(plan: AbstractPlan, options?: LayoutOptions): Layo
       const isLast = idx === colRoomNames.length - 1;
       if (isLast) {
         // Last room: take remaining space, but cap at its max area
-        const maxArea = getMaxRoomArea(name);
+        const maxArea = getMaxRoomArea(name, totalArea);
         const maxH = maxArea / roomW;
         roomH = Math.min(remainingH, maxH);
       } else {
@@ -216,7 +216,7 @@ export function computeLayout(plan: AbstractPlan, options?: LayoutOptions): Layo
       }
 
       // ── Maximum room size caps ── (now applies to ALL rooms including last)
-      const maxArea = getMaxRoomArea(name);
+      const maxArea = getMaxRoomArea(name, totalArea);
       if (roomW * roomH > maxArea) {
         roomH = Math.max(1.5, maxArea / roomW);
       }
@@ -324,8 +324,8 @@ export function computeLayout(plan: AbstractPlan, options?: LayoutOptions): Layo
 
   // ── Post-processing: enforce zero-gap adjacency ──
   // Every column room must span full column width and stack flush
-  enforceZeroGapAdjacency(rooms, leftZoneX, leftZoneWidth, polyBounds.y, leftEndY);
-  enforceZeroGapAdjacency(rooms, rightZoneX, rightZoneWidth, polyBounds.y, rightEndY);
+  enforceZeroGapAdjacency(rooms, leftZoneX, leftZoneWidth, polyBounds.y, leftEndY, totalArea);
+  enforceZeroGapAdjacency(rooms, rightZoneX, rightZoneWidth, polyBounds.y, rightEndY, totalArea);
 
   // Step 4: Building polygon is decorative outline only — do NOT clip rooms.
   // Clipping destroys usable room area and creates gaps between rooms.
@@ -672,18 +672,22 @@ function getMinRoomWidth(name: string): number {
   return 2.0;
 }
 
-/** Get maximum area (m²) for a room type — prevents rooms from ballooning */
-function getMaxRoomArea(name: string): number {
+/** Get maximum area (m²) for a room type — scales with total building area */
+function getMaxRoomArea(name: string, totalArea: number): number {
   const n = name.toLowerCase();
-  if (/ensuite/i.test(n)) return 5;
-  if (/bathroom/i.test(n)) return 8;
-  if (/laundry/i.test(n)) return 6;
-  if (/office|study/i.test(n)) return 12;
-  if (/bedroom/i.test(n) && !/master/i.test(n)) return 18;
-  if (/master/i.test(n)) return 28;       // master bedroom max ~28m²
-  if (/living|lounge|family/i.test(n)) return 32;  // living room max ~32m²
-  if (/kitchen/i.test(n)) return 20;       // kitchen max ~20m²
-  if (/dining/i.test(n)) return 16;
+  // Base max for a ~150m² house; scale up proportionally for larger buildings
+  const baseScale = Math.min(totalArea / 150, 3.0); // cap at 3x for sanity
+  const s = Math.max(baseScale, 0.7); // floor at 0.7x for very small houses
+
+  if (/ensuite/i.test(n)) return Math.round(5 * s);
+  if (/bathroom/i.test(n)) return Math.round(8 * s);
+  if (/laundry/i.test(n)) return Math.round(6 * s);
+  if (/office|study/i.test(n)) return Math.round(12 * s);
+  if (/bedroom/i.test(n) && !/master/i.test(n)) return Math.round(18 * s);
+  if (/master/i.test(n)) return Math.round(28 * s);
+  if (/living|lounge|family/i.test(n)) return Math.round(32 * s);
+  if (/kitchen/i.test(n)) return Math.round(20 * s);
+  if (/dining/i.test(n)) return Math.round(16 * s);
   return 999; // garage, hallway, etc. — no cap
 }
 
@@ -696,7 +700,8 @@ function enforceZeroGapAdjacency(
   colX: number,
   colWidth: number,
   colStartY: number,
-  colEndY: number
+  colEndY: number,
+  totalArea: number
 ): void {
   const TOL = 0.1;
 
@@ -717,7 +722,7 @@ function enforceZeroGapAdjacency(
   // ── Enforce max area caps: trim any room that exceeds its max ──
   let trimmedTotal = 0;
   for (const room of colRooms) {
-    const maxArea = getMaxRoomArea(room.name);
+    const maxArea = getMaxRoomArea(room.name, totalArea);
     const currentArea = room.width * room.height;
     if (currentArea > maxArea + 0.1) {
       const trimmedH = maxArea / room.width;
@@ -740,7 +745,7 @@ function enforceZeroGapAdjacency(
   if (excess > TOL && colRooms.length > 0) {
     // Sort by priority: give excess to rooms furthest from their max cap first
     const eligible = colRooms.map(r => {
-      const maxArea = getMaxRoomArea(r.name);
+      const maxArea = getMaxRoomArea(r.name, totalArea);
       const currentArea = r.width * r.height;
       const headroom = Math.max(0, maxArea - currentArea);
       return { room: r, headroom };
@@ -873,12 +878,12 @@ function enforceKitchenGarageAdjacency(
 
   // ── Re-stack BOTH columns so zero-gap holds ──
   // Garage's column now has kitchen instead of adjacentRoom
-  enforceZeroGapAdjacency(rooms, colX, colW, colStartY, colEndY);
+  enforceZeroGapAdjacency(rooms, colX, colW, colStartY, colEndY, 150);
   // The other column (where adjacentRoom moved) also needs re-stacking
   const otherColX = garageCol === "left" ? rightZoneX : leftZoneX;
   const otherColW = garageCol === "left" ? rightZoneWidth : leftZoneWidth;
   const otherEndY = garageCol === "left" ? rightEndY : leftEndY;
-  enforceZeroGapAdjacency(rooms, otherColX, otherColW, colStartY, otherEndY);
+  enforceZeroGapAdjacency(rooms, otherColX, otherColW, colStartY, otherEndY, 150);
 
   // Verify adjacency was achieved
   if (findWallBetween(garage, kitchen)) {
