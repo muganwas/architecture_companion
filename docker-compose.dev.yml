@@ -9,6 +9,7 @@ services:
     env_file:
       - .env
     environment:
+      - NEXT_PUBLIC_APP_URL=http://0.0.0.0:${APP_PORT:-3000}
       - WATCHPACK_POLLING=${WATCHPACK_POLLING:-true}
       - CHOKIDAR_USEPOLLING=${CHOKIDAR_USEPOLLING:-true}
     volumes:
