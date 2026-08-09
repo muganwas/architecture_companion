@@ -37,5 +37,8 @@ USER nextjs
 
 EXPOSE 3000
 ENV PORT=3000
+# Override Docker's HOSTNAME (container ID) so Next.js binds to 0.0.0.0
+# instead of a single network interface IP.
+ENV HOSTNAME=0.0.0.0
 
 CMD ["node", "server.js"]
