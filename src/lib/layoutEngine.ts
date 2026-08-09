@@ -315,17 +315,17 @@ export function computeLayout(plan: AbstractPlan, options?: LayoutOptions): Layo
   hallway.height = maxEndY - polyBounds.y;
   hallway.area = parseFloat((hallway.width * hallway.height).toFixed(1));
 
-  // ── Post-processing: carve ensuite from master bedroom FIRST ──
-  // (must happen before dominance check so master's final size is used)
+  // ── Post-processing: enforce zero-gap adjacency FIRST ──
+  // Every column room must span full column width and stack flush.
+  // Must run before ensuite carving so the ensuite is placed inside the master's final position.
+  enforceZeroGapAdjacency(rooms, leftZoneX, leftZoneWidth, polyBounds.y, leftEndY, totalArea);
+  enforceZeroGapAdjacency(rooms, rightZoneX, rightZoneWidth, polyBounds.y, rightEndY, totalArea);
+
+  // ── Post-processing: carve ensuite from master bedroom ──
   carveEnsuiteFromMaster(rooms, hallway);
 
   // ── Post-processing: enforce master bedroom dominance ──
   enforceMasterDominance(rooms);
-
-  // ── Post-processing: enforce zero-gap adjacency ──
-  // Every column room must span full column width and stack flush
-  enforceZeroGapAdjacency(rooms, leftZoneX, leftZoneWidth, polyBounds.y, leftEndY, totalArea);
-  enforceZeroGapAdjacency(rooms, rightZoneX, rightZoneWidth, polyBounds.y, rightEndY, totalArea);
 
   // Step 4: Building polygon is decorative outline only — do NOT clip rooms.
   // Clipping destroys usable room area and creates gaps between rooms.
@@ -925,14 +925,16 @@ function carveEnsuiteFromMaster(rooms: GeneratedRoom[], hallway: GeneratedRoom):
   const master = rooms.find(r => /master/i.test(r.name));
   if (!master) return;
 
-  // Don't create ensuite if master is too small
-  if (master.area < 20) return;
+  // Don't create ensuite if master is too small (needs space for bed + ensuite)
+  if (master.area < 14) return;
 
   // Don't carve if there's already an ensuite in the rooms
   if (rooms.some(r => /ensuite/i.test(r.name))) return;
 
-  const ensuiteW = 2.0;
-  const ensuiteH = 2.5;
+  // Scale ensuite size to master bedroom: smaller master → smaller ensuite
+  const scale = master.area < 18 ? 0.8 : master.area < 24 ? 0.9 : 1.0;
+  const ensuiteW = 1.8 * scale;
+  const ensuiteH = 2.2 * scale;
   const ensuiteArea = ensuiteW * ensuiteH; // 5.0m²
 
   // Safety: ensuite must fit inside master
@@ -1406,9 +1408,11 @@ function generateDoors(rooms: GeneratedRoom[], skipWalls?: Set<string>, kitchenL
     if (/ensuite/i.test(room.name)) {
       const master = rooms.find(r => /master/i.test(r.name));
       if (master) {
-        // Compute building extents to determine which walls are exterior
+        // Compute building extents from INTERIOR rooms only (exclude porches/balconies
+        // which extend beyond the building and would skew the exterior-wall detection)
         let maxX = 0, maxY = 0;
         for (const r of rooms) {
+          if (/porch|balcony/i.test(r.name)) continue;
           if (r.x + r.width > maxX) maxX = r.x + r.width;
           if (r.y + r.height > maxY) maxY = r.y + r.height;
         }
@@ -1779,21 +1783,20 @@ function generateBalconyDoors(rooms: GeneratedRoom[]): Door[] {
 
     const doorWidth = 2.0; // wide sliding/French door for balcony access
 
-    // Only the host-room door is created — a single door on the interior room
-    // correctly shows the access point to the exterior extension.
-    const hostWall = oppositeWall(wall);
-    const hostWallLen = hostWall === "left" || hostWall === "right" ? host.height : host.width;
-    const hostOffset = Math.max(doorWidth / 2 + 0.15, Math.min(hostWallLen - doorWidth / 2 - 0.15, hostWallLen * 0.5));
+    // Place the door on the BALCONY side — always aligns with the balcony position.
+    // This is more intuitive than placing it on the host room's wall.
+    const balconyWallLen = wall === "left" || wall === "right" ? balcony.height : balcony.width;
+    const balconyOffset = Math.max(doorWidth / 2 + 0.15, Math.min(balconyWallLen - doorWidth / 2 - 0.15, balconyWallLen * 0.5));
 
     doors.push({
-      room: host.name,
-      wall: hostWall,
-      offset: hostOffset,
+      room: balcony.name,
+      wall,
+      offset: balconyOffset,
       width: doorWidth,
       swing: "in",
     });
 
-    console.log(`[balcony-door] "${host.name}" → "${balcony.name}" on ${hostWall} wall`);
+    console.log(`[balcony-door] "${balcony.name}" ← "${host.name}" on ${wall} wall`);
   }
 
   return doors;
