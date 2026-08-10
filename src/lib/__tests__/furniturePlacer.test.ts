@@ -551,3 +551,64 @@ describe("Dining set integrity", () => {
     }
   });
 });
+
+/* ------------------------------------------------------------------ */
+/*  Desk set — every desk must have a chair                             */
+/* ------------------------------------------------------------------ */
+
+describe("Desk set integrity", () => {
+  it("every desk has an accompanying office chair", () => {
+    // Office
+    const office = makeRoom({ name: "Office", width: 3, height: 3, area: 9 });
+    const officeResult = suggestFurniture([office]);
+    const officeDesks = officeResult.filter((pf) => pf.itemId === "desk");
+    const officeChairs = officeResult.filter((pf) => pf.itemId === "office-chair");
+    if (officeDesks.length > 0) {
+      expect(officeChairs.length).toBeGreaterThanOrEqual(1);
+    }
+
+    // Master bedroom
+    const master = makeRoom({ name: "Master Bedroom", width: 5, height: 4.5, area: 22 });
+    const bedResult = suggestFurniture([master]);
+    const bedDesks = bedResult.filter((pf) => pf.itemId === "desk");
+    const bedChairs = bedResult.filter((pf) => pf.itemId === "office-chair");
+    if (bedDesks.length > 0) {
+      expect(bedChairs.length).toBeGreaterThanOrEqual(1);
+    }
+  });
+
+  it("no orphaned desk without a chair, and vice versa", () => {
+    const sizes = [8, 12, 18, 25];
+    for (const area of sizes) {
+      const room = makeRoom({
+        name: "Office",
+        width: Math.sqrt(area),
+        height: Math.sqrt(area),
+        area,
+      });
+      const result = suggestFurniture([room]);
+
+      const deskCount = result.filter((pf) => pf.itemId === "desk").length;
+      const chairCount = result.filter((pf) => pf.itemId === "office-chair").length;
+
+      if (deskCount > 0) expect(chairCount).toBeGreaterThanOrEqual(1);
+      if (chairCount > 0) expect(deskCount).toBeGreaterThanOrEqual(1);
+    }
+  });
+
+  it("office chair is positioned in front of the desk (within 1m)", () => {
+    const office = makeRoom({ name: "Office", width: 3, height: 3, area: 9 });
+    const result = suggestFurniture([office]);
+
+    const desk = result.find((pf) => pf.itemId === "desk");
+    const chair = result.find((pf) => pf.itemId === "office-chair");
+
+    if (desk && chair) {
+      const dx = chair.x - desk.x;
+      const dy = chair.y - desk.y;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+      // Chair should be within 1m of desk center
+      expect(dist).toBeLessThan(1.0);
+    }
+  });
+});

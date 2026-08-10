@@ -337,8 +337,9 @@ function sameGroup(id1: string, id2: string): boolean {
   const livingItems = ["sofa", "coffee-table", "tv-unit", "armchair", "side-table", "rug-large"];
   const bedItems = ["bed-", "side-table"]; // wardrobe intentionally excluded — must not overlap bed
   const diningItems = ["dining-table", "dining-chair"]; // table + chairs form a combined set
+  const deskItems = ["desk", "office-chair"]; // desk + chair form a combined set
 
-  const groups = [kitchenItems, bathItems, livingItems, bedItems, diningItems];
+  const groups = [kitchenItems, bathItems, livingItems, bedItems, diningItems, deskItems];
   for (const group of groups) {
     const m1 = group.some(prefix => id1.includes(prefix));
     const m2 = group.some(prefix => id2.includes(prefix));
@@ -497,6 +498,88 @@ function placeDiningSet(
 
   console.log(`[dining] "${room.name}" (${room.area.toFixed(0)}m²) → ${config.tableId} ×${config.tableScale.toFixed(2)} + ${config.chairCount} chairs ✅`);
   return result;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Atomic desk set: desk + chair as a single unit                     */
+/*  If the desk fits but the chair doesn't, neither is placed.         */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Try to place a desk + chair against a wall. The chair sits in front
+ * of the desk (offset 0.5m toward room center from the desk).
+ * Returns both items if the full set fits, null otherwise.
+ */
+function placeDeskSet(
+  room: GeneratedRoom,
+  preferredX: number,
+  preferredY: number,
+  preferredRot: number,
+  deskScale: number,
+  existingItems: PlacedFurniture[],
+  obstZones: ObstructionZone[]
+): PlacedFurniture[] | null {
+  const desk = getFurnitureById("desk");
+  const chair = getFurnitureById("office-chair");
+  if (!desk || !chair) return null;
+
+  // Positions to try: preferred first, then alternatives
+  const positions: Array<{ x: number; y: number; rot: number }> = [];
+  const cx = room.x + room.width / 2;
+  const cy = room.y + room.height / 2;
+
+  // Add the preferred position first
+  positions.push({ x: preferredX, y: preferredY, rot: preferredRot });
+
+  // If preferred is near back wall, add symmetric alternatives
+  const nearBackWall = Math.abs(preferredY - (room.y + room.height)) < 1.0;
+  const nearFrontWall = Math.abs(preferredY - room.y) < 1.0;
+  if (nearBackWall) {
+    positions.push(
+      { x: room.x + 0.9, y: room.y + room.height - 0.5, rot: 0 },
+      { x: room.x + 0.5, y: room.y + 0.9, rot: 180 },
+      { x: room.x + room.width - 0.5, y: room.y + 0.9, rot: 180 },
+    );
+  }
+
+  for (const pos of positions) {
+    const dw = desk.width * deskScale;
+    const dh = desk.height * deskScale;
+
+    // Desk must fit in bounds
+    if (!isFurnitureInBounds(pos.x, pos.y, dw, dh, room)) continue;
+    // Desk must not collide with existing
+    if (collidesWithExisting(pos.x, pos.y, dw, dh, room.name, existingItems, "desk")) continue;
+    // Desk must not overlap door/window zones
+    if (overlapsObstruction(pos.x, pos.y, dw / 2, dh / 2, obstZones)) continue;
+
+    // Chair position: in front of the desk (0.5m offset toward room center)
+    // The desk's "front" depends on rotation — for rot=0, the front is at y - dh/2
+    let chairX = pos.x;
+    let chairY = pos.y;
+    if (pos.rot === 0) chairY -= dh / 2 + 0.4;
+    else if (pos.rot === 180) chairY += dh / 2 + 0.4;
+    else if (pos.rot === 90) chairX -= dh / 2 + 0.4;
+    else if (pos.rot === 270) chairX += dh / 2 + 0.4;
+
+    const cw = chair.width;
+    const ch = chair.height;
+
+    // Chair must fit in bounds
+    if (!isFurnitureInBounds(chairX, chairY, cw, ch, room)) continue;
+    // Chair must not collide with existing
+    if (collidesWithExisting(chairX, chairY, cw, ch, room.name, existingItems, "office-chair")) continue;
+    // Chair must not overlap door/window zones
+    if (overlapsObstruction(chairX, chairY, cw / 2, ch / 2, obstZones)) continue;
+
+    // All checks passed — return atomic set
+    return [
+      { itemId: "desk", room: room.name, x: pos.x, y: pos.y, rotation: pos.rot as 0 | 90 | 180 | 270, scale: deskScale },
+      { itemId: "office-chair", room: room.name, x: chairX, y: chairY, rotation: 0, scale: 1.0 },
+    ];
+  }
+
+  return null;
 }
 
 export function suggestFurniture(rooms: GeneratedRoom[], doors: Door[] = [], windows: Window[] = []): PlacedFurniture[] {
@@ -857,43 +940,15 @@ export function suggestFurniture(rooms: GeneratedRoom[], doors: Door[] = [], win
       }
       if (wardResult) placed.push(wardResult);
 
-      // Desk for master or larger bedrooms — prefer back wall, avoid windows/doors
+      // Desk for master or larger bedrooms — atomic desk + chair set
       if (roomArea >= 14 && rw >= 2 && rh >= 2.5) {
         const bedObstZones = obstructionZonesByRoom.get(room.name) || [];
-        // Try right side of back wall first, then alternative positions
-        const deskPrefs = [
-          { x: room.x + rw - 0.9, y: room.y + rh - 0.5, rot: 0 },
-          { x: room.x + 0.9, y: room.y + rh - 0.5, rot: 0 },
-          { x: room.x + rw - 0.5, y: room.y + 0.9, rot: 180 },
-          { x: room.x + 0.5, y: room.y + 0.9, rot: 180 },
-        ];
-        let deskResult: PlacedFurniture | null = null;
-        const deskItem = getFurnitureById("desk");
-        if (deskItem) {
-          for (const dp of deskPrefs) {
-            const dw = deskItem.width * 0.9;
-            const dh = deskItem.height * 0.9;
-            if (isFurnitureInBounds(dp.x, dp.y, dw, dh, room) &&
-                !collidesWithExisting(dp.x, dp.y, dw, dh, room.name, placed, "desk") &&
-                !overlapsObstruction(dp.x, dp.y, dw / 2, dh / 2, bedObstZones)) {
-              deskResult = { itemId: "desk", room: room.name, x: dp.x, y: dp.y, rotation: dp.rot as 0 | 90 | 180 | 270, scale: 0.9 };
-              break;
-            }
-          }
-        }
-        if (!deskResult) {
-          deskResult = smartPlace("desk", room, room.x + rw - 0.9, room.y + rh - 0.5, 0, 0.9, placed, bedObstZones, "desk");
-        }
-        if (deskResult) {
-          placed.push(deskResult);
-          placed.push({
-            itemId: "office-chair",
-            room: room.name,
-            x: deskResult.x,
-            y: deskResult.y - 0.5,
-            rotation: 0,
-            scale: 1.0,
-          });
+        const deskSet = placeDeskSet(
+          room, room.x + rw - 0.9, room.y + rh - 0.5, 0, 0.9,
+          placed, bedObstZones
+        );
+        if (deskSet) {
+          for (const pf of deskSet) placed.push(pf);
         }
       }
 
@@ -1040,22 +1095,16 @@ export function suggestFurniture(rooms: GeneratedRoom[], doors: Door[] = [], win
     /* ---- OFFICE / STUDY ---- */
     if (/office|study/i.test(name)) {
       const officeObstZones = obstructionZonesByRoom.get(room.name) || [];
-      placed.push({
-        itemId: "desk",
-        room: room.name,
-        x: cx,
-        y: room.y + rh * 0.35,
-        rotation: 0,
-        scale: 1.0,
-      });
-      placed.push({
-        itemId: "office-chair",
-        room: room.name,
-        x: cx,
-        y: room.y + rh * 0.6,
-        rotation: 0,
-        scale: 1.0,
-      });
+
+      // Atomic desk + chair set — if it doesn't all fit, nothing is placed
+      const deskSet = placeDeskSet(
+        room, cx, room.y + rh * 0.35, 0, 1.0,
+        placed, officeObstZones
+      );
+      if (deskSet) {
+        for (const pf of deskSet) placed.push(pf);
+      }
+
       // Bookshelf — wall-mounted, avoid windows/doors. Try all rotations.
       if (rw >= 2) {
         let shelfResult: PlacedFurniture | null = null;
