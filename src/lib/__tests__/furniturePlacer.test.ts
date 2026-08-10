@@ -28,26 +28,27 @@ function makeRoom(
 function makeDoor(
   overrides: Partial<Door> & { room: string } = { room: "Bedroom 1" }
 ): Door {
+  const { room, ...rest } = overrides;
   return {
-    room: overrides.room,
+    room,
     wall: "bottom",
     offset: 2,
     width: 0.9,
     swing: "in",
-    ...overrides,
+    ...rest,
   };
 }
 
 function makeWindow(
   overrides: Partial<Window> & { room: string } = { room: "Bedroom 1" }
 ): Window {
+  const { room, ...rest } = overrides;
   return {
-    room: overrides.room,
+    room,
     wall: "top",
     offset: 2,
     width: 1.2,
-    sillHeight: 0.9,
-    ...overrides,
+    ...rest,
   };
 }
 
@@ -476,6 +477,76 @@ describe("Wall objects avoid windows", () => {
       if (inWindowZone) {
         // If it is, it should at least be at an alternative position
         // (this is a soft check — the desk might fit adjacent to the window)
+      }
+    }
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/*  Dining set — every table must have chairs                           */
+/* ------------------------------------------------------------------ */
+
+describe("Dining set integrity", () => {
+  it("every dining table has at least 2 accompanying chairs", () => {
+    const room = makeRoom({ name: "Dining Room", width: 5, height: 4, area: 20 });
+    const result = suggestFurniture([room]);
+
+    const tables = result.filter((pf) => pf.itemId.startsWith("dining-table"));
+    const chairs = result.filter((pf) => pf.itemId === "dining-chair");
+
+    if (tables.length > 0) {
+      expect(chairs.length).toBeGreaterThanOrEqual(2);
+      for (const pf of result) {
+        expect(pf.room).toBe("Dining Room");
+      }
+    }
+  });
+
+  it("no orphaned dining tables without chairs across sizes", () => {
+    const sizes = [6, 8, 12, 18, 25, 40];
+    for (const area of sizes) {
+      const room = makeRoom({
+        name: "Dining",
+        width: Math.sqrt(area * 1.2),
+        height: Math.sqrt(area / 1.2),
+        area,
+      });
+      const result = suggestFurniture([room]);
+
+      const tableCount = result.filter((pf) => pf.itemId.startsWith("dining-table")).length;
+      const chairCount = result.filter((pf) => pf.itemId === "dining-chair").length;
+
+      if (tableCount > 0) {
+        expect(chairCount).toBeGreaterThanOrEqual(2);
+      }
+      if (chairCount > 0) {
+        expect(tableCount).toBeGreaterThanOrEqual(1);
+      }
+    }
+  });
+
+  it("chair count scales with room size", () => {
+    const small = makeRoom({ name: "Dining", width: 3, height: 3, area: 9 });
+    const large = makeRoom({ name: "Dining", width: 6, height: 5, area: 30 });
+
+    const s = suggestFurniture([small]).filter((pf) => pf.itemId === "dining-chair").length;
+    const l = suggestFurniture([large]).filter((pf) => pf.itemId === "dining-chair").length;
+
+    if (s > 0 && l > 0) expect(l).toBeGreaterThanOrEqual(s);
+  });
+
+  it("chairs are positioned around the table (within 1.5m)", () => {
+    const room = makeRoom({ name: "Dining Room", width: 5, height: 4, area: 20 });
+    const result = suggestFurniture([room]);
+
+    const table = result.find((pf) => pf.itemId.startsWith("dining-table"));
+    const chairs = result.filter((pf) => pf.itemId === "dining-chair");
+
+    if (table && chairs.length > 0) {
+      for (const chair of chairs) {
+        const dx = chair.x - table.x;
+        const dy = chair.y - table.y;
+        expect(Math.sqrt(dx * dx + dy * dy)).toBeLessThan(1.5);
       }
     }
   });

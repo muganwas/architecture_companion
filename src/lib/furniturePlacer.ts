@@ -336,8 +336,9 @@ function sameGroup(id1: string, id2: string): boolean {
   const bathItems = ["toilet", "sink-bathroom", "bathtub", "shower"];
   const livingItems = ["sofa", "coffee-table", "tv-unit", "armchair", "side-table", "rug-large"];
   const bedItems = ["bed-", "side-table"]; // wardrobe intentionally excluded — must not overlap bed
+  const diningItems = ["dining-table", "dining-chair"]; // table + chairs form a combined set
 
-  const groups = [kitchenItems, bathItems, livingItems, bedItems];
+  const groups = [kitchenItems, bathItems, livingItems, bedItems, diningItems];
   for (const group of groups) {
     const m1 = group.some(prefix => id1.includes(prefix));
     const m2 = group.some(prefix => id2.includes(prefix));
@@ -367,6 +368,135 @@ function getRoomFurnitureScale(room: GeneratedRoom): number {
 
   const ratio = Math.sqrt(room.area / standardArea);
   return Math.max(0.8, Math.min(1.35, ratio));
+}
+
+/* ------------------------------------------------------------------ */
+/*  Atomic dining set: table + chairs as a single unit                 */
+/*  Scales table size AND chair count with room area.                  */
+/*  If the full set doesn't fit, the next-smaller config is tried.     */
+/*  If nothing fits, nothing is placed.                                */
+/* ------------------------------------------------------------------ */
+
+interface DiningConfig {
+  tableId: string;
+  chairCount: number;
+  tableScale: number;
+}
+
+/** Build a priority-ordered list of dining configs for a room size.
+ *  Larger rooms get bigger tables and more chairs.
+ *  The ABSOLUTE MINIMUM is a 4-seat table + 2 chairs — always the final fallback. */
+function getDiningConfigs(roomArea: number): DiningConfig[] {
+  if (roomArea >= 35) return [
+    { tableId: "dining-table-6", chairCount: 8, tableScale: 1.15 },
+    { tableId: "dining-table-6", chairCount: 6, tableScale: 1.1 },
+    { tableId: "dining-table-6", chairCount: 6, tableScale: 1.0 },
+    { tableId: "dining-table-6", chairCount: 4, tableScale: 0.9 },
+    { tableId: "dining-table-4", chairCount: 4, tableScale: 1.0 },
+    { tableId: "dining-table-4", chairCount: 2, tableScale: 0.85 },
+  ];
+  if (roomArea >= 22) return [
+    { tableId: "dining-table-6", chairCount: 6, tableScale: 1.1 },
+    { tableId: "dining-table-6", chairCount: 6, tableScale: 1.0 },
+    { tableId: "dining-table-6", chairCount: 4, tableScale: 0.9 },
+    { tableId: "dining-table-4", chairCount: 4, tableScale: 1.0 },
+    { tableId: "dining-table-4", chairCount: 2, tableScale: 0.85 },
+  ];
+  if (roomArea >= 14) return [
+    { tableId: "dining-table-6", chairCount: 6, tableScale: 1.0 },
+    { tableId: "dining-table-6", chairCount: 4, tableScale: 0.9 },
+    { tableId: "dining-table-4", chairCount: 4, tableScale: 1.0 },
+    { tableId: "dining-table-4", chairCount: 2, tableScale: 0.85 },
+  ];
+  if (roomArea >= 10) return [
+    { tableId: "dining-table-4", chairCount: 4, tableScale: 0.95 },
+    { tableId: "dining-table-4", chairCount: 2, tableScale: 0.85 },
+  ];
+  if (roomArea >= 7) return [
+    { tableId: "dining-table-4", chairCount: 4, tableScale: 0.85 },
+    { tableId: "dining-table-4", chairCount: 2, tableScale: 0.75 },
+  ];
+  // Absolute minimum for tiny dining nooks
+  return [
+    { tableId: "dining-table-4", chairCount: 2, tableScale: 0.7 },
+  ];
+}
+
+/**
+ * Try to place an entire dining set (table + all chairs) in the room.
+ * Returns the placed items if the full set fits, null otherwise.
+ * This is atomic: either everything fits or nothing is placed.
+ */
+function placeDiningSet(
+  room: GeneratedRoom,
+  config: DiningConfig,
+  existingItems: PlacedFurniture[],
+  obstZones: ObstructionZone[]
+): PlacedFurniture[] | null {
+  const table = getFurnitureById(config.tableId);
+  const chair = getFurnitureById("dining-chair");
+  if (!table || !chair) return null;
+
+  const cx = room.x + room.width / 2;
+  const cy = room.y + room.height / 2;
+  const rot = room.width > room.height ? 0 : 90;
+
+  const tw = table.width * config.tableScale;
+  const th = table.height * config.tableScale;
+
+  // 1. Table must fit in bounds
+  if (!isFurnitureInBounds(cx, cy, tw, th, room)) return null;
+
+  // 2. Table must not collide with existing furniture
+  if (collidesWithExisting(cx, cy, tw, th, room.name, existingItems, config.tableId)) return null;
+
+  // 3. Table must not overlap door/window zones
+  if (overlapsObstruction(cx, cy, tw / 2, th / 2, obstZones)) return null;
+
+  // 4. Pre-compute and validate ALL chair positions
+  const cw = chair.width * config.tableScale;
+  const ch = chair.height * config.tableScale;
+  const dist = Math.max(tw, th) * 0.55;
+  const chairPositions: Array<{ x: number; y: number }> = [];
+
+  for (let i = 0; i < config.chairCount; i++) {
+    const angle = (i / config.chairCount) * Math.PI * 2 - Math.PI / 2;
+    const chX = cx + Math.cos(angle) * dist;
+    const chY = cy + Math.sin(angle) * dist;
+
+    // Chair must be in room bounds
+    if (!isFurnitureInBounds(chX, chY, cw, ch, room)) return null;
+    // Chair must not overlap obstruction zones
+    if (overlapsObstruction(chX, chY, cw / 2, ch / 2, obstZones)) return null;
+    // Chair must not collide with existing furniture
+    if (collidesWithExisting(chX, chY, cw, ch, room.name, existingItems, "dining-chair")) return null;
+
+    chairPositions.push({ x: chX, y: chY });
+  }
+
+  // ── All checks passed — build the atomic result ──
+  const result: PlacedFurniture[] = [
+    {
+      itemId: config.tableId,
+      room: room.name,
+      x: cx, y: cy,
+      rotation: rot as 0 | 90 | 180 | 270,
+      scale: config.tableScale,
+    },
+  ];
+
+  for (const pos of chairPositions) {
+    result.push({
+      itemId: "dining-chair",
+      room: room.name,
+      x: pos.x, y: pos.y,
+      rotation: 0,
+      scale: config.tableScale,
+    });
+  }
+
+  console.log(`[dining] "${room.name}" (${room.area.toFixed(0)}m²) → ${config.tableId} ×${config.tableScale.toFixed(2)} + ${config.chairCount} chairs ✅`);
+  return result;
 }
 
 export function suggestFurniture(rooms: GeneratedRoom[], doors: Door[] = [], windows: Window[] = []): PlacedFurniture[] {
@@ -617,49 +747,22 @@ export function suggestFurniture(rooms: GeneratedRoom[], doors: Door[] = [], win
       }
     }
 
-    /* ---- DINING ROOM — guaranteed table + chairs that fit ---- */
+    /* ---- DINING ROOM — atomic table + chairs set ---- */
     if (/dining/i.test(name)) {
-      // Scale table based on room size
-      const tableId = roomArea >= 20 ? "dining-table-6" : "dining-table-4";
-      const tableScale = roomScale * (roomArea < 8 ? 0.7 : roomArea < 12 ? 0.85 : 1.0);
-      const table = getFurnitureById(tableId);
-      if (table) {
-        placed.push({
-          itemId: tableId,
-          room: room.name,
-          x: cx,
-          y: cy,
-          rotation: rw > rh ? 0 : 90,
-          scale: tableScale,
-        });
+      const diningObstZones = obstructionZonesByRoom.get(room.name) || [];
+      const configs = getDiningConfigs(roomArea);
 
-        // Chairs around the table — only place those that fit in the room
-        const maxChairs = tableId === "dining-table-6" ? 6 : 4;
-        // Small rooms get fewer chairs
-        const targetChairs = roomArea < 8 ? 2 : roomArea < 14 ? 4 : maxChairs;
-        const tw = table.width * tableScale;
-        const th = table.height * tableScale;
-        let chairsPlaced = 0;
-
-        for (let i = 0; i < maxChairs && chairsPlaced < targetChairs; i++) {
-          const angle = (i / maxChairs) * Math.PI * 2 - Math.PI / 2;
-          const dist = Math.max(tw, th) * 0.55;
-          const cx2 = cx + Math.cos(angle) * dist;
-          const cy2 = cy + Math.sin(angle) * dist;
-
-          // Only place chair if it fits in room bounds
-          if (pointInRoomBounds(cx2, cy2, room)) {
-            placed.push({
-              itemId: "dining-chair",
-              room: room.name,
-              x: cx2,
-              y: cy2,
-              rotation: 0,
-              scale: tableScale,
-            });
-            chairsPlaced++;
-          }
+      let diningPlaced = false;
+      for (const config of configs) {
+        const result = placeDiningSet(room, config, placed, diningObstZones);
+        if (result) {
+          for (const pf of result) placed.push(pf);
+          diningPlaced = true;
+          break;
         }
+      }
+      if (!diningPlaced) {
+        console.log(`[dining] "${room.name}" (${roomArea.toFixed(0)}m²) ❌ no config fits`);
       }
     }
 

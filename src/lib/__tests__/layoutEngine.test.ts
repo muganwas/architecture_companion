@@ -3,8 +3,7 @@
 /* ------------------------------------------------------------------ */
 
 import { describe, it, expect } from "vitest";
-import { computeLayout, isFurnitureInBounds, AbstractPlan } from "../layoutEngine";
-import { LayoutResult } from "../ai-client";
+import { computeLayout, isFurnitureInBounds, AbstractPlan, LayoutResult } from "../layoutEngine";
 
 /* ---- helpers ---- */
 
