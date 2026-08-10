@@ -50,26 +50,91 @@ export function computeLayout(plan: AbstractPlan, options?: LayoutOptions): Layo
   let { totalArea } = plan;
   const { hallwaySide, zones, roomRatios, exteriorExtensions } = plan;
 
-  // Sanity: minimum total area is 60m², maximum 500m²
-  if (totalArea < 60) {
-    console.warn(`Layout engine: totalArea ${totalArea}m² too small, defaulting to 100m²`);
-    totalArea = 100;
+  // Determine home type for size capping
+  const allZoneNames = Object.values(zones).flat();
+  const bedroomCount = allZoneNames.filter(n => /bedroom/i.test(n) && !/master/i.test(n)).length;
+  const hasMaster = allZoneNames.some(n => /master/i.test(n));
+  const totalBeds = bedroomCount + (hasMaster ? 1 : 0);
+  const isStudio = /studio/i.test(allZoneNames.join(" ")) || (totalBeds === 0 && allZoneNames.some(n => /living|lounge/i.test(n)));
+
+  // Studios and small homes: cap max size and set sensible defaults
+  if (isStudio) {
+    if (totalArea > 40) { console.warn(`Layout engine: studio capped from ${totalArea}m² to 40m²`); totalArea = 40; }
+    if (totalArea < 20) totalArea = 25; // cozy default
+  } else if (totalBeds === 1) {
+    if (totalArea > 65) { console.warn(`Layout engine: 1-bedroom capped from ${totalArea}m² to 65m²`); totalArea = 65; }
+    if (totalArea < 35) totalArea = 45; // comfortable default
+  } else {
+    // 2+ bedrooms: use user-specified area with normal min/max
+    if (totalArea < 60) {
+      console.warn(`Layout engine: totalArea ${totalArea}m² too small, defaulting to 100m²`);
+      totalArea = 100;
+    }
   }
   if (totalArea > 500) {
     console.warn(`Layout engine: totalArea ${totalArea}m² too large, capping at 500m²`);
     totalArea = 500;
   }
 
-  // ── Step 0: Scale column widths with total area for squarer rooms ──
-  // Fixed columns work for ~150m² but produce tall/thin rooms at larger areas.
-  // Scale colWidth proportionally to sqrt(area), capped for realistic sizing.
+  // ── Step 0: Compute building dimensions for pleasant proportions ──
+  // Goal: aspect ratio between 0.8 and 1.25 (slightly rectangular, never long/thin).
+  // For small homes (studio, 1-bed), use a single squarish block.
+  // For larger homes, use two columns with a hallway between them.
   const hallwayWidth = 1.2;
-  const colWidth = Math.max(5.0, Math.min(8.0, (Math.sqrt(totalArea) - hallwayWidth) / 2));
-  const buildingW = colWidth * 2 + hallwayWidth;
-  const buildingH = totalArea / buildingW;
-  const polyBounds = { x: 0, y: 0, w: buildingW, h: buildingH };
+  let buildingW: number;
+  let buildingH: number;
 
-  console.log(`[layout] area=${totalArea}m² colWidth=${colWidth.toFixed(1)}m building=${buildingW.toFixed(1)}×${buildingH.toFixed(1)}m ratio=${(buildingW/buildingH).toFixed(2)}`);
+  // Determine if hallway will be skipped (computed again after isStudio detection)
+  const habitableRoomsPre = allZoneNames.filter(n =>
+    !/hallway|corridor|porch|balcony|bathroom|ensuite|powder|wc|toilet/i.test(n)
+  );
+  const willSkipHallway = habitableRoomsPre.length <= 3 || isStudio;
+
+  if (willSkipHallway) {
+    // Single-block layout — make it squarish
+    const side = Math.sqrt(totalArea);
+    // Slightly rectangular is fine (0.85–1.15), never more than 1.4:1
+    buildingW = Math.max(4.5, side);
+    buildingH = totalArea / buildingW;
+    // If too narrow, adjust: swap dimensions for a wider-than-tall layout
+    if (buildingW / buildingH > 1.5) {
+      // Too wide for height — cap width and let height grow
+      buildingW = Math.sqrt(totalArea * 1.15);
+      buildingH = totalArea / buildingW;
+    }
+    // Final safety: ensure neither dimension is absurd
+    if (buildingW / buildingH > 1.4) {
+      buildingW = Math.sqrt(totalArea * 1.2);
+      buildingH = totalArea / buildingW;
+    }
+    if (buildingH / buildingW > 1.4) {
+      buildingH = Math.sqrt(totalArea * 1.2);
+      buildingW = totalArea / buildingH;
+    }
+    // Ensure minimum dimensions
+    buildingW = Math.max(buildingW, 4.5);
+    buildingH = Math.max(buildingH, 3.0);
+  } else {
+    // Two-column layout with hallway
+    const colWidth = Math.max(5.0, Math.min(8.0, (Math.sqrt(totalArea) - hallwayWidth) / 2));
+    buildingW = colWidth * 2 + hallwayWidth;
+    buildingH = totalArea / buildingW;
+    // Enforce maximum aspect ratio of 1.5:1 for two-column layouts too
+    if (buildingW / buildingH > 1.5) {
+      buildingW = Math.sqrt(totalArea * 1.3);
+      buildingH = totalArea / buildingW;
+    }
+    if (buildingH / buildingW > 1.5) {
+      buildingH = Math.sqrt(totalArea * 1.3);
+      buildingW = totalArea / buildingH;
+    }
+  }
+
+  console.log(`[layout] area=${totalArea}m² building=${buildingW.toFixed(1)}×${buildingH.toFixed(1)}m ratio=${(Math.max(buildingW,buildingH)/Math.min(buildingW,buildingH)).toFixed(2)} ${willSkipHallway ? "compact" : "two-column"}`);
+
+  // For two-column layouts, compute the effective column width
+  const colWidth = willSkipHallway ? buildingW : (buildingW - hallwayWidth) / 2;
+  const polyBounds = { x: 0, y: 0, w: buildingW, h: buildingH };
 
   // Normalize ratios to sum to 1.0 (exclude hallway, porch, balcony from ratio calc)
   const interiorRatios: Record<string, number> = {};
@@ -85,7 +150,20 @@ export function computeLayout(plan: AbstractPlan, options?: LayoutOptions): Layo
     }
   }
 
-  // Step 1: Place hallway between the two fixed-width columns.
+  // Step 1: Determine if this plan needs a hallway.
+  // Small homes (studio, 1-bed, compact) don't need corridors — the living
+  // room serves as the central circulation space.
+  // (allZoneNames, isStudio, and habitableRooms are already computed above)
+  const habitableRooms = allZoneNames.filter(n =>
+    !/hallway|corridor|porch|balcony|bathroom|ensuite|powder|wc|toilet/i.test(n)
+  );
+  const skipHallway = habitableRooms.length <= 3 || isStudio;
+
+  if (skipHallway) {
+    console.log(`[layout] skipping hallway — ${habitableRooms.length} habitable room(s), ${isStudio ? "studio" : "compact"} layout`);
+  }
+
+  // Step 2: Place hallway between the two fixed-width columns (if needed).
   // The hallway is an INTERIOR corridor — it must never be on an exterior wall,
   // especially when balconies are present (balconies need exterior walls).
   let effectiveHallwaySide = hallwaySide;
@@ -102,20 +180,22 @@ export function computeLayout(plan: AbstractPlan, options?: LayoutOptions): Layo
 
   const hallway: GeneratedRoom = {
     name: "Hallway",
-    x: hallwayX,
+    x: skipHallway ? 0 : hallwayX,
     y: polyBounds.y,
-    width: hallwayWidth,
+    width: skipHallway ? 0 : hallwayWidth,
     height: buildingH,
-    area: hallwayWidth * buildingH,
+    area: skipHallway ? 0 : (hallwayWidth * buildingH),
   };
 
-  // Step 2: Fixed column zones — rooms span full column width, touching hallway
+  // Step 3: Fixed column zones — rooms span full column width, touching hallway.
+  // Without a hallway, use a single full-width column.
   const leftZoneX = polyBounds.x;
-  const leftZoneWidth = colWidth;
+  const leftZoneWidth = skipHallway ? buildingW : colWidth;
   const rightZoneX = polyBounds.x + colWidth + hallwayWidth;
   const rightZoneWidth = colWidth;
 
-  const rooms: GeneratedRoom[] = [hallway];
+  const rooms: GeneratedRoom[] = [];
+  if (!skipHallway) rooms.push(hallway);
 
   // Step 3: Place rooms in columns with balanced proportions
   const minRoomWidth = 2.2; // minimum room width in meters (fits a bed)
@@ -342,8 +422,12 @@ export function computeLayout(plan: AbstractPlan, options?: LayoutOptions): Layo
 
   // ── Post-processing: carve ensuite from master bedroom ──
   // Only carve if the LLM's abstract plan explicitly includes an Ensuite.
-  // Prevents adding a 2nd bathroom when the user only asked for 1.
   carveEnsuiteFromMaster(rooms, hallway, zones);
+
+  // ── Post-processing: carve bathroom from studio room ──
+  // Studios are single open rooms — the bathroom should be carved from
+  // the studio room rather than floating as a separate column zone.
+  carveBathroomFromStudio(rooms, zones);
 
   // Step 4: Building polygon is decorative outline only — do NOT clip rooms.
   // Clipping destroys usable room area and creates gaps between rooms.
@@ -1167,6 +1251,137 @@ function carveEnsuiteFromMaster(
   }
 }
 
+/**
+ * Carve a bathroom from the studio room (like an ensuite from a master bedroom).
+ * Studios have a single open room — the bathroom should be placed in a corner,
+ * touching two walls, so the remaining studio space stays contiguous.
+ */
+function carveBathroomFromStudio(
+  rooms: GeneratedRoom[],
+  zones?: Record<string, string[]>
+): void {
+  const studio = rooms.find(r => /studio/i.test(r.name));
+  const bathroom = rooms.find(r => /bathroom/i.test(r.name) && !/ensuite/i.test(r.name));
+
+  // Only carve if both Studio and Bathroom exist as separate rooms
+  if (!studio || !bathroom) return;
+
+  // Don't carve if bathroom is already inside the studio bounds
+  const bInStudio =
+    bathroom.x >= studio.x - 0.01 &&
+    bathroom.y >= studio.y - 0.01 &&
+    bathroom.x + bathroom.width <= studio.x + studio.width + 0.01 &&
+    bathroom.y + bathroom.height <= studio.y + studio.height + 0.01;
+
+  if (bInStudio) {
+    // Already carved — nothing to do
+    return;
+  }
+
+  if (!zones) return;
+
+  const allZoneNames = Object.values(zones).flat().filter(Boolean) as string[];
+  const hasStudio = allZoneNames.some(n => /studio/i.test(n));
+  const hasBathroom = allZoneNames.some(n => /bathroom/i.test(n) && !/ensuite/i.test(n));
+  if (!hasStudio || !hasBathroom) return;
+
+  // ── Minimum functional bathroom: toilet + sink + shower/bathtub ──
+  const MIN_BATH_AREA = 6.0;   // m²
+  const MIN_BATH_W = 1.8;      // m
+  const MIN_BATH_H = 2.5;      // m
+
+  // Studio must be large enough to carve a bathroom and still be functional
+  if (studio.area < MIN_BATH_AREA + 12) {
+    console.warn(`[studio-bath] ⚠️ studio too small (${studio.area.toFixed(1)}m²) to carve bathroom — leaving separate.`);
+    return;
+  }
+
+  // Use the bathroom's original ratio to determine its size
+  const bathArea = Math.max(MIN_BATH_AREA, Math.min(bathroom.area, studio.area * 0.25));
+  const bathW = Math.max(MIN_BATH_W, Math.min(3.0, Math.sqrt(bathArea * 0.75)));
+  const bathH = Math.max(MIN_BATH_H, bathArea / bathW);
+
+  if (bathW > studio.width - 1.0 || bathH > studio.height - 2.0) {
+    console.warn(`[studio-bath] ⚠️ bathroom (${bathW.toFixed(1)}×${bathH.toFixed(1)}m) too large for studio (${studio.width.toFixed(1)}×${studio.height.toFixed(1)}m).`);
+    return;
+  }
+
+  // Place bathroom in a corner of the studio — prefer exterior walls,
+  // but AVOID the main entrance wall and balcony wall.
+  // The entrance should lead into the living area, not into the bathroom.
+  const ext = {
+    top:    isExteriorWall(studio, "top", rooms),
+    bottom: isExteriorWall(studio, "bottom", rooms),
+    left:   isExteriorWall(studio, "left", rooms),
+    right:  isExteriorWall(studio, "right", rooms),
+  };
+
+  // Determine which walls are "blocked" — these should not have the bathroom.
+  // Primary entrance is at the front (bottom). If bottom has a balcony, entrance
+  // shifts to the left wall (apartment entrance priority: bottom → left → right → top).
+  const blockedWalls = new Set<"bottom" | "top" | "left" | "right">();
+
+  // Detect which wall has the balcony
+  let balconyWall: "bottom" | "top" | "left" | "right" | null = null;
+  const hasBalcony = rooms.some(r => /balcony/i.test(r.name));
+  if (hasBalcony) {
+    const balconyRoom = rooms.find(r => /balcony/i.test(r.name));
+    if (balconyRoom) {
+      const TOL = 0.5;
+      // Test all 4 sides — the balcony sits outside the studio, so its inner
+      // edge touches the studio's outer edge on the shared wall.
+      if (Math.abs(balconyRoom.y - (studio.y + studio.height)) < TOL) balconyWall = "bottom";
+      else if (Math.abs(balconyRoom.y + balconyRoom.height - studio.y) < TOL) balconyWall = "top";
+      else if (Math.abs(balconyRoom.x - (studio.x + studio.width)) < TOL) balconyWall = "right";
+      else if (Math.abs(balconyRoom.x + balconyRoom.width - studio.x) < TOL) balconyWall = "left";
+    }
+  }
+
+  // Block the balcony wall (it's occupied)
+  if (balconyWall) blockedWalls.add(balconyWall);
+
+  // Block the primary entrance wall: bottom by default, or left if bottom has balcony
+  const entranceWall = (balconyWall === "bottom") ? "left" : "bottom";
+  blockedWalls.add(entranceWall);
+
+  // Also block the fallback entrance wall (right) if both bottom AND left are taken
+  if (balconyWall === "bottom" || balconyWall === "left") {
+    // If bottom is balcony → entrance on left → right is backup
+    // If left is balcony → entrance on bottom → right is backup
+    blockedWalls.add("right");
+  }
+
+  const corners: Array<{ label: string; x: number; y: number; extCount: number; blockedCount: number }> = [
+    { label: "top-left",     x: studio.x,                             y: studio.y,                              extCount: (ext.top ? 1 : 0) + (ext.left ? 1 : 0),   blockedCount: (blockedWalls.has("top") ? 1 : 0) + (blockedWalls.has("left") ? 1 : 0) },
+    { label: "top-right",    x: studio.x + studio.width - bathW,      y: studio.y,                              extCount: (ext.top ? 1 : 0) + (ext.right ? 1 : 0),  blockedCount: (blockedWalls.has("top") ? 1 : 0) + (blockedWalls.has("right") ? 1 : 0) },
+    { label: "bottom-left",  x: studio.x,                             y: studio.y + studio.height - bathH,     extCount: (ext.bottom ? 1 : 0) + (ext.left ? 1 : 0), blockedCount: (blockedWalls.has("bottom") ? 1 : 0) + (blockedWalls.has("left") ? 1 : 0) },
+    { label: "bottom-right", x: studio.x + studio.width - bathW,      y: studio.y + studio.height - bathH,     extCount: (ext.bottom ? 1 : 0) + (ext.right ? 1 : 0), blockedCount: (blockedWalls.has("bottom") ? 1 : 0) + (blockedWalls.has("right") ? 1 : 0) },
+  ];
+
+  // Sort: prefer corners with FEWER blocked walls, then by exterior wall count
+  corners.sort((a, b) => {
+    if (a.blockedCount !== b.blockedCount) return a.blockedCount - b.blockedCount;
+    return b.extCount - a.extCount;
+  });
+  const best = corners[0];
+
+  console.log(`[studio-bath] carving bathroom from Studio corner="${best.label}" extWalls=${best.extCount} blockedWalls=${Array.from(blockedWalls)} (${bathW.toFixed(1)}×${bathH.toFixed(1)}m, ${(bathW*bathH).toFixed(1)}m²)`);
+
+  // Remove the old separate bathroom
+  const bathIdx = rooms.indexOf(bathroom);
+  if (bathIdx >= 0) rooms.splice(bathIdx, 1);
+
+  // Add the carved bathroom at the corner
+  rooms.push({
+    name: "Bathroom",
+    x: best.x,
+    y: best.y,
+    width: parseFloat(bathW.toFixed(2)),
+    height: parseFloat(bathH.toFixed(2)),
+    area: parseFloat((bathW * bathH).toFixed(1)),
+  });
+}
+
 /* ------------------------------------------------------------------ */
 /*  Building polygon generator (creative perimeters)                   */
 /* ------------------------------------------------------------------ */
@@ -1341,12 +1556,14 @@ function createSmartExtension(
   // Find the host room, skipping already-used hosts for balconies
   let hostRoom: GeneratedRoom | undefined;
   if (isBalcony) {
-    // Priority: living room → master → any bedroom → kitchen → any room on exterior
+    // Priority: living room → studio → master → any bedroom → kitchen → any room on exterior
     hostRoom = rooms.find(r => /living|lounge|family/i.test(r.name) && !usedHosts.has(r.name))
+            || rooms.find(r => /studio/i.test(r.name) && !usedHosts.has(r.name))
             || rooms.find(r => /master/i.test(r.name) && !usedHosts.has(r.name))
             || rooms.find(r => /bedroom/i.test(r.name) && !usedHosts.has(r.name))
             // Fall back to any room even if already used
             || rooms.find(r => /living|lounge|family/i.test(r.name))
+            || rooms.find(r => /studio/i.test(r.name))
             || rooms.find(r => /master/i.test(r.name))
             || rooms.find(r => /bedroom/i.test(r.name))
             // Ultimate fallback: any non-hallway, non-extension room
@@ -1645,6 +1862,38 @@ function generateDoors(rooms: GeneratedRoom[], skipWalls?: Set<string>, kitchenL
       continue;
     }
 
+    // Bathroom carved from studio — door faces into the studio room
+    // (same pattern as ensuite carved from master bedroom)
+    if (/bathroom/i.test(room.name) && !/ensuite/i.test(room.name)) {
+      const studio = rooms.find(r => /studio/i.test(r.name));
+      if (studio) {
+        // Check if bathroom is inside the studio bounds (carved)
+        const bInStudio =
+          room.x >= studio.x - 0.01 &&
+          room.y >= studio.y - 0.01 &&
+          room.x + room.width <= studio.x + studio.width + 0.01 &&
+          room.y + room.height <= studio.y + studio.height + 0.01;
+
+        if (bInStudio) {
+          // Find which wall of the bathroom is exterior — door goes opposite
+          const extWall = findExteriorWall(room, rooms);
+          const doorWall = oppositeWall(extWall);
+          const wallLen = doorWall === "left" || doorWall === "right" ? room.height : room.width;
+          const doorWidth = 0.8;
+          const doorOffset = Math.max(doorWidth / 2 + 0.15, Math.min(wallLen - doorWidth / 2 - 0.15, wallLen * 0.5));
+
+          doors.push({
+            room: room.name,
+            wall: doorWall,
+            offset: doorOffset,
+            width: doorWidth,
+            swing: "in",
+          });
+          continue;
+        }
+      }
+    }
+
     if (hallway) {
       const wall = findWallToHallway(room, hallway);
       if (wall) {
@@ -1865,7 +2114,8 @@ function generateMainEntrance(rooms: GeneratedRoom[], isGroundFloor: boolean = t
   // ── Apartment/upper-floor: exterior wall WITHOUT a balcony ──
   // E.Hallway (building corridor) and balconies serve different purposes
   // and must not occupy the same exterior side of the building.
-  if (!isGroundFloor && hallway) {
+  // Studios and compact apartments may not have a hallway — still need E.Hallway access.
+  if (!isGroundFloor) {
     const balconySides = getBalconySides(rooms);
     const TOL = 0.1;
 

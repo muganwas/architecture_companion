@@ -468,6 +468,15 @@ export function getFurnitureById(id: string): FurnitureItem | undefined {
  */
 export function getFurnitureForRoom(roomName: string): FurnitureItem[] {
   const lower = roomName.toLowerCase();
+
+  // Studio: match items suitable for living room, bedroom, OR kitchen
+  if (/studio/i.test(lower)) {
+    const studioRooms = ["living room", "bedroom", "kitchen", "dining", "master bedroom"];
+    return furnitureCatalog.filter((item) =>
+      item.suitableRooms.some((r) => studioRooms.some(s => r.includes(s)))
+    );
+  }
+
   return furnitureCatalog.filter((item) =>
     item.suitableRooms.some((r) => lower.includes(r))
   );

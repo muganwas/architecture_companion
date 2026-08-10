@@ -248,4 +248,89 @@ describe("windows", () => {
       }
     }
   });
+
+  /* ---- Studio / studio apartment ---- */
+
+  it("studio is one room (no separate bedroom, kitchen, or living zones)", () => {
+    const studioPlan: AbstractPlan = {
+      totalArea: 30, hallwayWidth: 1.2, hallwaySide: "center",
+      zones: { frontLeft: ["Studio", "Bathroom"] },
+      roomRatios: { "Studio": 0.85, "Bathroom": 0.15 },
+      exteriorExtensions: {},
+    };
+    const r = computeLayout(studioPlan);
+    const roomNames = r.rooms.map(r => r.name.toLowerCase());
+    // Must have Studio and Bathroom
+    expect(roomNames).toContain("studio");
+    expect(roomNames).toContain("bathroom");
+    // Must NOT have separate Living Room, Bedroom, or Kitchen
+    expect(roomNames).not.toContain("living room");
+    expect(roomNames).not.toContain("bedroom");
+    expect(roomNames).not.toContain("kitchen");
+  });
+
+  it("studio has no hallway", () => {
+    const studioPlan: AbstractPlan = {
+      totalArea: 30, hallwayWidth: 1.2, hallwaySide: "center",
+      zones: { frontLeft: ["Studio", "Bathroom"] },
+      roomRatios: { "Studio": 0.85, "Bathroom": 0.15 },
+      exteriorExtensions: {},
+    };
+    const r = computeLayout(studioPlan);
+    expect(r.rooms.some(r => /hallway/i.test(r.name))).toBe(false);
+  });
+
+  it("studio has no corridor even with hallwaySide specified", () => {
+    const studioPlan: AbstractPlan = {
+      totalArea: 30, hallwayWidth: 1.2, hallwaySide: "right",
+      zones: { frontLeft: ["Studio", "Bathroom"] },
+      roomRatios: { "Studio": 0.85, "Bathroom": 0.15 },
+      exteriorExtensions: {},
+    };
+    const r = computeLayout(studioPlan);
+    expect(r.rooms.some(r => /hallway/i.test(r.name))).toBe(false);
+  });
+
+  it("studio total area defaults to 25m² if below 20", () => {
+    const tiny: AbstractPlan = {
+      totalArea: 15, hallwayWidth: 1.0, hallwaySide: "center",
+      zones: { frontLeft: ["Studio", "Bathroom"] },
+      roomRatios: { "Studio": 0.85, "Bathroom": 0.15 },
+      exteriorExtensions: {},
+    };
+    const r = computeLayout(tiny);
+    const studio = r.rooms.find(x => /studio/i.test(x.name));
+    expect(studio).toBeDefined();
+    expect(studio!.area).toBeGreaterThanOrEqual(20);
+  });
+
+  it("studio total area caps at 40m²", () => {
+    const large: AbstractPlan = {
+      totalArea: 80, hallwayWidth: 1.5, hallwaySide: "center",
+      zones: { frontLeft: ["Studio", "Bathroom"] },
+      roomRatios: { "Studio": 0.85, "Bathroom": 0.15 },
+      exteriorExtensions: {},
+    };
+    const r = computeLayout(large);
+    // The layout engine should cap the total area to 40m² for studios
+    // So the total occupied (excl. hallways, porches, balconies) should be ~40m²
+    const totalOccupied = r.rooms
+      .filter(x => !/hallway|balcony|porch/i.test(x.name))
+      .reduce((sum, x) => sum + x.area, 0);
+    // Allow some padding for building polygon fill
+    expect(totalOccupied).toBeLessThanOrEqual(55);
+    expect(totalOccupied).toBeGreaterThanOrEqual(25);
+  });
+
+  it("studio with balcony gets exterior extension", () => {
+    const studioPlan: AbstractPlan = {
+      totalArea: 30, hallwayWidth: 1.2, hallwaySide: "center",
+      zones: { frontLeft: ["Studio", "Bathroom"] },
+      roomRatios: { "Studio": 0.85, "Bathroom": 0.15 },
+      exteriorExtensions: { "Balcony": "right" },
+    };
+    const r = computeLayout(studioPlan);
+    const balcony = r.rooms.find(x => /balcony/i.test(x.name));
+    expect(balcony, "Studio plan with balcony should have a balcony room").toBeDefined();
+  });
 });

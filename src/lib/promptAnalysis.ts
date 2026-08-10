@@ -21,7 +21,14 @@ export function analyzePrompt(description: string): PromptAnalysis {
   const bedMatch = desc.match(/(\d+)\s*-?\s*bed(?:room)?/i);
   const bathMatch = desc.match(/(\d+)\s*-?\s*bath(?:room)?/i);
 
-  if (bedMatch) {
+  // Detect studio: user said "studio" but did NOT explicitly say "X bedroom".
+  // "2 bedroom studio" → 2 bedrooms, not a studio layout.
+  const isStudio = /\bstudio\b/i.test(desc) && !bedMatch;
+
+  if (isStudio) {
+    found.push("Studio — open-plan single room");
+    // Studio inherently includes sleeping area, so don't ask for bedroom count
+  } else if (bedMatch) {
     found.push(`${bedMatch[1]} bedroom${bedMatch[1] !== "1" ? "s" : ""}`);
   } else {
     missing.push("Number of bedrooms");
@@ -30,6 +37,9 @@ export function analyzePrompt(description: string): PromptAnalysis {
 
   if (bathMatch) {
     found.push(`${bathMatch[1]} bathroom${bathMatch[1] !== "1" ? "s" : ""}`);
+  } else if (isStudio) {
+    // Studios always need a bathroom — default to 1
+    found.push("1 bathroom");
   } else {
     missing.push("Number of bathrooms");
     defaults.push({ label: "Bathrooms", value: "1 bathroom (default)" });
@@ -44,10 +54,10 @@ export function analyzePrompt(description: string): PromptAnalysis {
     "multi-story", "multi story", "split-level",
   ];
 
-  const foundType = houseTypes.find(t => desc.includes(t));
+  const foundType = houseTypes.find(t => desc.includes(t) && (!isStudio || t !== "studio"));
   if (foundType) {
     found.push(`House type: ${foundType}`);
-  } else {
+  } else if (!isStudio) {
     missing.push("House type (bungalow, apartment, etc.)");
     defaults.push({ label: "House type", value: "Single-story (default)" });
   }
@@ -136,12 +146,20 @@ export function analyzePrompt(description: string): PromptAnalysis {
 
   // Summary
   const summaryParts: string[] = [];
-  if (bedMatch) summaryParts.push(`${bedMatch[1]} bedroom${bedMatch[1] !== "1" ? "s" : ""}`);
-  else summaryParts.push("2 bedrooms");
-  if (bathMatch) summaryParts.push(`${bathMatch[1]} bathroom${bathMatch[1] !== "1" ? "s" : ""}`);
-  else summaryParts.push("1 bathroom");
+  if (isStudio) {
+    summaryParts.push("Studio apartment");
+  } else if (bedMatch) {
+    summaryParts.push(`${bedMatch[1]} bedroom${bedMatch[1] !== "1" ? "s" : ""}`);
+  } else {
+    summaryParts.push("2 bedrooms");
+  }
+  if (bathMatch) {
+    summaryParts.push(`${bathMatch[1]} bathroom${bathMatch[1] !== "1" ? "s" : ""}`);
+  } else {
+    summaryParts.push("1 bathroom");
+  }
   if (foundType) summaryParts.push(foundType);
-  else summaryParts.push("single-story home");
+  else if (!isStudio) summaryParts.push("single-story home");
   summaryParts.push(foundStyle ? `${foundStyle} style` : "Modern style");
 
   const summary = summaryParts.join(", ");

@@ -919,4 +919,80 @@ describe("Bathroom fixture placement", () => {
     // Long dimension 3.2m, area ≥ 6 → bathtub should be placed
     expect(enoughResult.find((pf) => pf.itemId === "bathtub")).toBeDefined();
   });
+
+  /* ---- Studio furniture placement ---- */
+
+  it("studio room gets bed (sleeping zone)", () => {
+    const studio = makeRoom({ name: "Studio", width: 5, height: 6, area: 30 });
+    const bathroom = makeRoom({ name: "Bathroom", width: 2, height: 3, area: 6, x: 10, y: 0 });
+    const result = suggestFurniture([studio, bathroom]);
+    const studioItems = result.filter(pf => pf.room === "Studio");
+    const bedIds = ["bed-single", "bed-double", "bed-queen"];
+    const hasBed = studioItems.some(pf => bedIds.includes(pf.itemId));
+    expect(hasBed, "Studio must have a bed").toBe(true);
+  });
+
+  it("studio room gets living furniture (sofa, TV, coffee table)", () => {
+    const studio = makeRoom({ name: "Studio", width: 5, height: 6, area: 30 });
+    // Bathroom is separate, not inside studio bounds (simulates multi-room or carved layout)
+    const bathroom = makeRoom({ name: "Bathroom", width: 2, height: 3, area: 6, x: 10, y: 0 });
+    const result = suggestFurniture([studio, bathroom]);
+    const studioItems = result.filter(pf => pf.room === "Studio");
+    const sofaIds = ["sofa-3-seater", "sofa-2-seater"];
+    const hasSofa = studioItems.some(pf => sofaIds.includes(pf.itemId));
+    const hasTv = studioItems.some(pf => pf.itemId === "tv-unit");
+    const hasCoffeeTable = studioItems.some(pf => pf.itemId === "coffee-table");
+    expect(hasSofa, "Studio must have a sofa").toBe(true);
+    expect(hasTv, "Studio must have a TV unit").toBe(true);
+    expect(hasCoffeeTable, "Studio must have a coffee table").toBe(true);
+  });
+
+  it("studio room gets kitchen counter and fridge when large enough", () => {
+    const studio = makeRoom({ name: "Studio", width: 5, height: 6, area: 30 });
+    // Bathroom is a separate room NOT inside studio bounds (simulates multi-room layout)
+    const bathroom = makeRoom({ name: "Bathroom", width: 2, height: 3, area: 6, x: 10, y: 0 });
+    const result = suggestFurniture([studio, bathroom]);
+    const studioItems = result.filter(pf => pf.room === "Studio");
+    const hasCounter = studioItems.some(pf =>
+      pf.itemId === "kitchen-counter-straight" || pf.itemId === "kitchen-counter-small"
+    );
+    const hasFridge = studioItems.some(pf => pf.itemId === "refrigerator");
+    expect(hasCounter, "Studio must have a kitchen counter").toBe(true);
+    expect(hasFridge, "Studio must have a refrigerator").toBe(true);
+  });
+
+  it("studio room gets wardrobe", () => {
+    const studio = makeRoom({ name: "Studio", width: 5, height: 6, area: 30 });
+    const bathroom = makeRoom({ name: "Bathroom", width: 2, height: 3, area: 6, x: 10, y: 0 });
+    const result = suggestFurniture([studio, bathroom]);
+    const studioItems = result.filter(pf => pf.room === "Studio");
+    expect(studioItems.some(pf => pf.itemId === "wardrobe"), "Studio must have a wardrobe").toBe(true);
+  });
+
+  it("studio furniture does not overlap bathroom fixtures", () => {
+    const studio = makeRoom({ name: "Studio", width: 5, height: 6, area: 30 });
+    const bathroom = makeRoom({ name: "Bathroom", width: 2, height: 3, area: 6, x: 10, y: 0 });
+    const result = suggestFurniture([studio, bathroom]);
+    const studioItems = result.filter(pf => pf.room === "Studio");
+    // All studio items must be inside the studio room bounds
+    for (const pf of studioItems) {
+      expect(pf.x, `Studio item ${pf.itemId} x out of bounds`).toBeGreaterThanOrEqual(studio.x);
+      expect(pf.x, `Studio item ${pf.itemId} x out of bounds`).toBeLessThanOrEqual(studio.x + studio.width);
+      expect(pf.y, `Studio item ${pf.itemId} y out of bounds`).toBeGreaterThanOrEqual(studio.y);
+      expect(pf.y, `Studio item ${pf.itemId} y out of bounds`).toBeLessThanOrEqual(studio.y + studio.height);
+    }
+  });
+
+  it("small studio gets single bed not double", () => {
+    const studio = makeRoom({ name: "Studio", width: 4, height: 4, area: 16 });
+    const bathroom = makeRoom({ name: "Bathroom", width: 2, height: 2, area: 4 });
+    const result = suggestFurniture([studio, bathroom]);
+    const studioItems = result.filter(pf => pf.room === "Studio");
+    const hasSingle = studioItems.some(pf => pf.itemId === "bed-single");
+    const hasDoubleOrQueen = studioItems.some(pf =>
+      pf.itemId === "bed-double" || pf.itemId === "bed-queen"
+    );
+    expect(hasSingle, "Small studio (< 18m²) should get single bed").toBe(true);
+    expect(hasDoubleOrQueen, "Small studio should NOT get double/queen bed").toBe(false);
+  });
 });
