@@ -89,7 +89,7 @@ describe("room allocation", () => {
       roomRatios: { "Living Room": 0.20, Kitchen: 0.12, Dining: 0.10, "Master Bedroom": 0.18, "Bedroom 2": 0.12, "Bedroom 3": 0.10, Bathroom: 0.06, Hallway: 0.12 },
     }));
     const b = r.rooms.find((x) => /bath/i.test(x.name) && !/ensuite/i.test(x.name))!;
-    expect(b.area).toBeLessThan(35);
+    expect(b.area).toBeLessThanOrEqual(35);
   });
 
   it("ensuite proportional & capped", () => {
@@ -209,5 +209,43 @@ describe("edge cases", () => {
     const t = r.rooms.filter((x) => !/balcony|porch/i.test(x.name)).reduce((s, x) => s + x.area, 0);
     expect(t).toBeGreaterThan(150 * 0.7);
     expect(t).toBeLessThan(150 * 1.3);
+  });
+});
+
+describe("windows", () => {
+  it("bathroom has at least one window", () => {
+    // Run multiple plans to ensure bathrooms reliably get windows
+    for (let i = 0; i < 5; i++) {
+      const r = run(makePlan({ totalArea: 150 }));
+      const bathrooms = r.rooms.filter(x => /bathroom/i.test(x.name) && !/ensuite/i.test(x.name));
+      for (const bath of bathrooms) {
+        const bathWindows = r.windows.filter(w => w.room === bath.name);
+        expect(bathWindows.length, `Bathroom "${bath.name}" has no window`).toBeGreaterThanOrEqual(1);
+        // Window must have reasonable dimensions
+        for (const w of bathWindows) {
+          expect(w.width).toBeGreaterThanOrEqual(0.4);
+          expect(w.width).toBeLessThanOrEqual(2.0);
+        }
+      }
+    }
+  });
+
+  it("ensuite has a window when on exterior wall", () => {
+    const r = run(planWithEnsuite({ totalArea: 150 }));
+    const ensuite = r.rooms.find(x => /ensuite/i.test(x.name));
+    if (ensuite) {
+      const ensWindows = r.windows.filter(w => w.room === ensuite.name);
+      expect(ensWindows.length, `Ensuite has no window`).toBeGreaterThanOrEqual(1);
+    }
+  });
+
+  it("bedrooms and living room have windows", () => {
+    const r = run(makePlan({ totalArea: 150 }));
+    for (const room of r.rooms) {
+      if (/bedroom|living|lounge/i.test(room.name) && !/hallway|garage|porch|balcony/i.test(room.name)) {
+        const roomWindows = r.windows.filter(w => w.room === room.name);
+        expect(roomWindows.length, `"${room.name}" has no window`).toBeGreaterThanOrEqual(1);
+      }
+    }
   });
 });

@@ -180,6 +180,12 @@ export function computeLayout(plan: AbstractPlan, options?: LayoutOptions): Layo
       let roomH = ratio * colHeight;
       let roomW = colWidth;
 
+      // Bathrooms, ensuites, and utility rooms keep a natural capped width
+      // for realistic proportions — not all rooms need to span the full column.
+      if (/bathroom|ensuite|powder|wc|laundry/i.test(name)) {
+        roomW = Math.min(colWidth, 3.0);
+      }
+
       // Enforce balanced proportions: max aspect ratio 2:1
       // Only cap HEIGHT (too tall) — never reduce WIDTH (creates gaps to hallway)
       if (roomH > roomW * 2.0) {
@@ -668,7 +674,7 @@ function getMinRoomArea(name: string, totalArea?: number): number {
   if (/bedroom/i.test(n)) return Math.max(9, totalArea ? totalArea * 0.07 : 9);
   if (/kitchen/i.test(n)) return Math.max(8, totalArea ? totalArea * 0.06 : 8);
   if (/dining/i.test(n)) return Math.max(8, totalArea ? totalArea * 0.06 : 8);
-  if (/bathroom|ensuite/i.test(n)) return Math.max(4, totalArea ? totalArea * 0.025 : 4);
+  if (/bathroom|ensuite/i.test(n)) return Math.max(7, totalArea ? totalArea * 0.07 : 7);
   if (/office|study/i.test(n)) return Math.max(7, totalArea ? totalArea * 0.05 : 7);
   if (/laundry/i.test(n)) return Math.max(4, totalArea ? totalArea * 0.03 : 4);
   return Math.max(4, totalArea ? totalArea * 0.03 : 4);
@@ -693,8 +699,8 @@ function getMaxRoomArea(name: string, totalArea: number): number {
   const scale = Math.max(totalArea / 150, 0.7);
 
   // Only cap sanitary/utility rooms — living spaces fill available area
-  if (/ensuite/i.test(n)) return Math.round(10 * scale);   // was 5 — raised 2x
-  if (/bathroom/i.test(n)) return Math.round(14 * scale);  // was 8 — raised 75%
+  if (/ensuite/i.test(n)) return Math.round(10 * scale);
+  if (/bathroom/i.test(n)) return Math.round(24 * scale);
   if (/laundry/i.test(n)) return Math.round(10 * scale);   // was 6 — raised 67%
 
   // Everything else: no hard cap — ratios determine size
@@ -722,8 +728,11 @@ function enforceZeroGapAdjacency(
 
   if (colRooms.length === 0) return;
 
-  // Fix widths: every room spans full column width, flush to hallway side
+  // Fix widths: every room spans full column width, flush to hallway side.
+  // Bathrooms, ensuites, powder rooms, WC, and laundry keep a natural capped
+  // width (≤2.5m) for realistic proportions — houses aren't uniform boxes.
   for (const room of colRooms) {
+    if (/bathroom|ensuite|powder|wc|laundry/i.test(room.name)) continue;
     room.x = colX;
     room.width = colWidth;
     room.area = parseFloat((room.width * room.height).toFixed(1));
@@ -753,23 +762,93 @@ function enforceZeroGapAdjacency(
   // that haven't hit their max area cap yet (not just the bottom room).
   const excess = (colEndY - expectedY) + (trimmedTotal / colWidth);
   if (excess > TOL && colRooms.length > 0) {
-    // Sort by priority: give excess to rooms furthest from their max cap first
+    // Sort by priority: bathrooms/ensuites below functional minimum (5.5m²) first,
+    // then by headroom (rooms furthest from max cap get more).
+    const FUNC_MIN_BATH = 7; // minimum to fit toilet + sink + shower/tub comfortably
     const eligible = colRooms.map(r => {
       const maxArea = getMaxRoomArea(r.name, totalArea);
       const currentArea = r.width * r.height;
       const headroom = Math.max(0, maxArea - currentArea);
-      return { room: r, headroom };
+      const isBath = /bathroom|ensuite|powder|wc/i.test(r.name);
+      const belowFuncMin = isBath && currentArea < FUNC_MIN_BATH ? 1 : 0;
+      return { room: r, headroom, belowFuncMin };
     }).filter(e => e.headroom > 0.1);
 
+    // Sort: bathrooms below functional min first, then by headroom (descending)
+    eligible.sort((a, b) => {
+      if (a.belowFuncMin !== b.belowFuncMin) return b.belowFuncMin - a.belowFuncMin;
+      return b.headroom - a.headroom;
+    });
+
     if (eligible.length > 0) {
-      const totalHeadroom = eligible.reduce((s, e) => s + e.headroom, 0);
       let remaining = excess;
+      // First pass: bring bathrooms up to functional minimum
       for (const e of eligible) {
-        // Distribute proportionally to headroom
-        const share = Math.min(remaining * (e.headroom / totalHeadroom), e.headroom / e.room.width);
-        e.room.height = parseFloat((e.room.height + share).toFixed(2));
-        e.room.area = parseFloat((e.room.width * e.room.height).toFixed(1));
-        remaining -= share * e.room.width;
+        if (!e.belowFuncMin) continue;
+        const deficit = FUNC_MIN_BATH - (e.room.width * e.room.height);
+        const neededH = deficit / e.room.width;
+        const give = Math.min(neededH, remaining);
+        if (give > 0.01) {
+          e.room.height = parseFloat((e.room.height + give).toFixed(2));
+          e.room.area = parseFloat((e.room.width * e.room.height).toFixed(1));
+          remaining -= give * e.room.width;
+          e.belowFuncMin = 0;
+        }
+      }
+      // Second pass: capped rooms (bathrooms, laundry) get full headroom,
+      // EXCEPT the top room — it gets ALL remaining space to reach the
+      // building edge (critical for top-wall windows).
+      const topRoom = colRooms[colRooms.length - 1];
+      const topIsCapped = eligible.some(e => e.room === topRoom && getMaxRoomArea(e.room.name, totalArea) < 999);
+      if (remaining > 0.01) {
+        for (const e of eligible) {
+          const maxArea = getMaxRoomArea(e.room.name, totalArea);
+          if (maxArea >= 999) continue; // uncapped — handle later
+          if (e.room === topRoom && topIsCapped) continue; // top room gets fourth pass
+          const currentArea = e.room.width * e.room.height;
+          const hr = Math.max(0, maxArea - currentArea);
+          if (hr < 0.1) continue;
+          const neededH = hr / e.room.width;
+          const give = Math.min(neededH, remaining);
+          if (give > 0.01) {
+            e.room.height = parseFloat((e.room.height + give).toFixed(2));
+            e.room.area = parseFloat((e.room.width * e.room.height).toFixed(1));
+            remaining -= give * e.room.width;
+          }
+        }
+      }
+      // Third pass: distribute whatever's left among uncapped rooms proportionally
+      if (remaining > 0.01) {
+        const uncapped = eligible.filter(e => {
+          const maxArea = getMaxRoomArea(e.room.name, totalArea);
+          return maxArea >= 999;
+        });
+        const totalUncappedHeadroom = uncapped.reduce((s, e) => {
+          const maxArea = getMaxRoomArea(e.room.name, totalArea);
+          const currentArea = e.room.width * e.room.height;
+          return s + Math.max(0, maxArea - currentArea);
+        }, 0);
+        if (totalUncappedHeadroom > 0.1) {
+          for (const e of uncapped) {
+            const currentArea = e.room.width * e.room.height;
+            const hr = Math.max(0, 999 - currentArea);
+            if (hr < 0.1) continue;
+            const share = Math.min(remaining * (hr / totalUncappedHeadroom), hr / e.room.width);
+            if (share > 0.01) {
+              e.room.height = parseFloat((e.room.height + share).toFixed(2));
+              e.room.area = parseFloat((e.room.width * e.room.height).toFixed(1));
+              remaining -= share * e.room.width;
+            }
+          }
+        }
+      }
+      // Fourth pass: TOP room (often a bathroom) fills ALL remaining space
+      // to the building edge, overriding any max area cap. This ensures
+      // its top wall IS the building exterior so it gets a window.
+      if (remaining > 0.01 && topRoom) {
+        topRoom.height = parseFloat((topRoom.height + remaining / topRoom.width).toFixed(2));
+        topRoom.area = parseFloat((topRoom.width * topRoom.height).toFixed(1));
+        remaining = 0;
       }
       // Re-stack after redistribution
       let y = colStartY;
@@ -1684,22 +1763,27 @@ function oppositeWall(wall: Door["wall"]): Door["wall"] {
   }
 }
 
-function generateWindows(rooms: GeneratedRoom[], buildingW: number, buildingH: number, allDoors: Door[]): Window[] {
+function generateWindows(rooms: GeneratedRoom[], _buildingW: number, _buildingH: number, allDoors: Door[]): Window[] {
   const windows: Window[] = [];
   const TOL = 0.1;
-  const WALL_MARGIN = 0.2; // minimum distance from room edge to window edge
-  const DOOR_GAP = 0.15;   // minimum gap between door edge and window edge
+  const WALL_MARGIN = 0.2;
+  const DOOR_GAP = 0.15;
+
+  // Use actual room extents for exterior wall detection, not formula dimensions
+  const bldMaxX = Math.max(...rooms.map(r => r.x + r.width));
+  const bldMaxY = Math.max(...rooms.map(r => r.y + r.height));
+  const bldMinX = Math.min(...rooms.map(r => r.x));
+  const bldMinY = Math.min(...rooms.map(r => r.y));
 
   for (const room of rooms) {
     if (/hallway|corridor|foyer|garage|porch|balcony/i.test(room.name)) continue;
 
-    // Exterior walls get windows
     const walls: Array<{ wall: Door["wall"]; len: number }> = [];
 
-    if (Math.abs(room.x) < TOL) walls.push({ wall: "left", len: room.height });
-    if (Math.abs(room.x + room.width - buildingW) < TOL) walls.push({ wall: "right", len: room.height });
-    if (Math.abs(room.y) < TOL) walls.push({ wall: "bottom", len: room.width });
-    if (Math.abs(room.y + room.height - buildingH) < TOL) walls.push({ wall: "top", len: room.width });
+    if (Math.abs(room.x - bldMinX) < TOL) walls.push({ wall: "left", len: room.height });
+    if (Math.abs(room.x + room.width - bldMaxX) < TOL) walls.push({ wall: "right", len: room.height });
+    if (Math.abs(room.y - bldMinY) < TOL) walls.push({ wall: "bottom", len: room.width });
+    if (Math.abs(room.y + room.height - bldMaxY) < TOL) walls.push({ wall: "top", len: room.width });
 
     for (const { wall, len } of walls) {
       // Collect all doors on this room + wall

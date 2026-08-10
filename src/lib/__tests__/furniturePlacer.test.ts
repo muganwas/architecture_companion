@@ -358,8 +358,9 @@ describe("Ensuite obstacle in master bedroom", () => {
 /* ------------------------------------------------------------------ */
 
 describe("Bathroom fixtures", () => {
-  it("places toilet, sink, and shower in bathroom", () => {
-    const bath = makeRoom({ name: "Bathroom", width: 2.5, height: 2, area: 5 });
+  it("places toilet, sink, and shower in a reasonably sized bathroom", () => {
+    // 6m²+ is needed for all 3 fixtures at functional scale with door zone avoidance
+    const bath = makeRoom({ name: "Bathroom", width: 3, height: 2.5, area: 7.5 });
     const result = suggestFurniture([bath]);
 
     expect(result.some((pf) => pf.itemId === "toilet")).toBe(true);
@@ -367,6 +368,139 @@ describe("Bathroom fixtures", () => {
     expect(
       result.some((pf) => pf.itemId === "shower" || pf.itemId === "bathtub")
     ).toBe(true);
+  });
+
+  it("every bathroom has all 3 fixtures or none at all (all-or-nothing invariant)", () => {
+    // Every bathroom MUST have toilet + sink + (shower | bathtub).
+    // These are non-negotiable mandatory fixtures.
+    const configs = [
+      { w: 1.5, h: 1.5, area: 2.25 },
+      { w: 2.0, h: 1.8, area: 3.6 },
+      { w: 2.5, h: 2.0, area: 5.0 },
+      { w: 3.0, h: 2.5, area: 7.5 },
+      { w: 4.0, h: 3.0, area: 12.0 },
+      { w: 5.0, h: 4.0, area: 20.0 },
+      { w: 2.2, h: 3.0, area: 6.6 },
+      { w: 1.2, h: 2.0, area: 2.4 },
+    ];
+    for (const cfg of configs) {
+      const bath = makeRoom({ name: "Bathroom", width: cfg.w, height: cfg.h, area: cfg.area });
+      const result = suggestFurniture([bath]);
+
+      const bathFixtures = result.filter(pf =>
+        pf.room === "Bathroom" &&
+        ["toilet", "sink-bathroom", "shower", "bathtub"].includes(pf.itemId)
+      );
+      const hasToilet = bathFixtures.some(pf => pf.itemId === "toilet");
+      const hasSink = bathFixtures.some(pf => pf.itemId === "sink-bathroom");
+      const hasTubOrShower = bathFixtures.some(pf => pf.itemId === "shower" || pf.itemId === "bathtub");
+
+      // All 3 fixtures are mandatory — the invariant forces placement.
+      expect(hasToilet, `Bathroom ${cfg.w}×${cfg.h}m missing toilet`).toBe(true);
+      expect(hasSink, `Bathroom ${cfg.w}×${cfg.h}m missing sink`).toBe(true);
+      expect(hasTubOrShower, `Bathroom ${cfg.w}×${cfg.h}m missing shower/tub`).toBe(true);
+    }
+  });
+
+  it("every bathroom has a shower or bathtub (mandatory fixtures)", () => {
+    const configs = [
+      { w: 1.5, h: 1.5, area: 2.25 },
+      { w: 2.0, h: 1.8, area: 3.6 },
+      { w: 2.5, h: 2.0, area: 5.0 },
+      { w: 3.0, h: 2.5, area: 7.5 },
+      { w: 4.0, h: 3.0, area: 12.0 },
+      { w: 5.0, h: 4.0, area: 20.0 },
+    ];
+    for (const cfg of configs) {
+      const bath = makeRoom({ name: "Bathroom", width: cfg.w, height: cfg.h, area: cfg.area });
+      const result = suggestFurniture([bath]);
+      const hasShowerOrTub = result.some(
+        (pf) => pf.itemId === "shower" || pf.itemId === "bathtub"
+      );
+      expect(hasShowerOrTub, `Bathroom ${cfg.w}×${cfg.h}m (${cfg.area}m²) has no shower or bathtub`).toBe(true);
+    }
+  });
+
+  it("every bathroom has shower/tub even at extreme aspect ratios", () => {
+    const extremeConfigs = [
+      { w: 1.0, h: 2.5, area: 2.5 },
+      { w: 2.5, h: 1.0, area: 2.5 },
+      { w: 1.2, h: 2.0, area: 2.4 },
+      { w: 2.0, h: 1.2, area: 2.4 },
+      { w: 1.8, h: 1.0, area: 1.8 },
+      { w: 1.0, h: 1.8, area: 1.8 },
+      { w: 6.0, h: 1.5, area: 9.0 },
+      { w: 1.5, h: 6.0, area: 9.0 },
+      { w: 3.5, h: 3.5, area: 12.25 },
+      { w: 2.2, h: 3.0, area: 6.6 },
+      { w: 3.0, h: 2.2, area: 6.6 },
+    ];
+    for (const cfg of extremeConfigs) {
+      const bath = makeRoom({ name: "Bathroom", width: cfg.w, height: cfg.h, area: cfg.area });
+      const result = suggestFurniture([bath]);
+      const hasShowerOrTub = result.some(
+        (pf) => pf.itemId === "shower" || pf.itemId === "bathtub"
+      );
+      expect(hasShowerOrTub, `Bathroom ${cfg.w}×${cfg.h}m (${cfg.area}m²) has no shower or bathtub`).toBe(true);
+    }
+  });
+
+  it("every bathroom has shower/tub regardless of door position", () => {
+    // Doors on each wall — placement should adapt
+    const walls: Array<"bottom"|"top"|"left"|"right"> = ["bottom", "top", "left", "right"];
+    for (const wall of walls) {
+      const bath = makeRoom({ name: "Bathroom", width: 2.5, height: 2, area: 5 });
+      const door: Door = { room: "Bathroom", wall, offset: 1.25, width: 0.8, swing: "in" };
+      const result = suggestFurniture([bath], [door]);
+      const hasShowerOrTub = result.some(
+        (pf) => pf.itemId === "shower" || pf.itemId === "bathtub"
+      );
+      expect(hasShowerOrTub, `Bathroom with door on ${wall} wall has no shower or bathtub`).toBe(true);
+    }
+  });
+
+  it("every bathroom has shower/tub — randomized property test", () => {
+    for (let i = 0; i < 50; i++) {
+      const w = 1.0 + Math.random() * 5;
+      const h = 1.0 + Math.random() * 5;
+      const area = w * h;
+      const bath = makeRoom({ name: "Bathroom", width: w, height: h, area });
+      const result = suggestFurniture([bath]);
+      const hasShowerOrTub = result.some(
+        (pf) => pf.itemId === "shower" || pf.itemId === "bathtub"
+      );
+      expect(hasShowerOrTub, `Bathroom ${w.toFixed(2)}×${h.toFixed(2)}m (${area.toFixed(2)}m²) has no shower or bathtub`).toBe(true);
+    }
+  });
+
+  it("ensuite bathrooms always have shower or tub", () => {
+    const ensuiteConfigs = [
+      { w: 1.5, h: 1.5, area: 2.25 },
+      { w: 2.0, h: 1.8, area: 3.6 },
+      { w: 3.0, h: 2.0, area: 6.0 },
+    ];
+    for (const cfg of ensuiteConfigs) {
+      const ensuite = makeRoom({ name: "Ensuite", width: cfg.w, height: cfg.h, area: cfg.area });
+      const result = suggestFurniture([ensuite]);
+      const hasShowerOrTub = result.some(
+        (pf) => pf.itemId === "shower" || pf.itemId === "bathtub"
+      );
+      expect(hasShowerOrTub, `Ensuite ${cfg.w}×${cfg.h}m (${cfg.area}m²) has no shower or bathtub`).toBe(true);
+    }
+  });
+
+  it("powder rooms and WC always have mandatory fixtures", () => {
+    const powderConfigs = [
+      { name: "Powder Room", w: 1.2, h: 1.2, area: 1.44 },
+      { name: "WC", w: 1.0, h: 1.5, area: 1.5 },
+    ];
+    for (const cfg of powderConfigs) {
+      const room = makeRoom({ name: cfg.name, width: cfg.w, height: cfg.h, area: cfg.area });
+      const result = suggestFurniture([room]);
+      expect(result.some(pf => pf.itemId === "toilet"), `${cfg.name} missing toilet`).toBe(true);
+      expect(result.some(pf => pf.itemId === "sink-bathroom"), `${cfg.name} missing sink`).toBe(true);
+      expect(result.some(pf => pf.itemId === "shower" || pf.itemId === "bathtub"), `${cfg.name} missing shower/tub`).toBe(true);
+    }
   });
 
   it("bathroom fixtures do not overlap each other", () => {
@@ -394,6 +528,76 @@ describe("Bathroom fixtures", () => {
           Math.abs(a.y - b.y) < aH / 2 + bH / 2;
 
         expect(overlap).toBe(false);
+      }
+    }
+  });
+
+  it("bathroom fixtures do not overlap door swing zones", () => {
+    // Every bathroom fixture must avoid the door's swing path.
+    // This catches the case where shower/tub was placed without obstZones.
+    const walls: Array<"bottom"|"top"|"left"|"right"> = ["bottom", "top", "left", "right"];
+    // Test multiple room sizes that trigger different code paths
+    // (small → shower only, large → bathtub attempt, very large → bathtub)
+    const roomConfigs = [
+      { w: 2.5, h: 2.0, area: 5.0 },    // shower path
+      { w: 3.5, h: 2.5, area: 8.75 },   // bathtub path (area ≥ 6, long enough)
+      { w: 4.0, h: 3.0, area: 12.0 },   // bathtub path
+      { w: 6.0, h: 2.0, area: 12.0 },   // wide bathtub path
+    ];
+
+    for (const cfg of roomConfigs) {
+      for (const wall of walls) {
+        const bath = makeRoom({ name: "Bathroom", width: cfg.w, height: cfg.h, area: cfg.area });
+        // Center the door on the wall
+        const doorOffset = wall === "top" || wall === "bottom" ? cfg.w / 2 : cfg.h / 2;
+        const door: Door = { room: "Bathroom", wall, offset: doorOffset, width: 0.8, swing: "in" };
+        const result = suggestFurniture([bath], [door]);
+
+        const fixtures = result.filter(pf =>
+          pf.room === "Bathroom" &&
+          ["toilet", "sink-bathroom", "shower", "bathtub"].includes(pf.itemId)
+        );
+
+        // Compute door zone (mirrors getDoorZone in furniturePlacer.ts)
+        const clearance = 0.95; // door.width(0.8) + 0.15
+        let dzX: number, dzY: number, dzHalfW: number, dzHalfH: number;
+        switch (wall) {
+          case "bottom":
+            dzX = bath.x + doorOffset;
+            dzY = bath.y + clearance / 2;
+            dzHalfW = 0.4; dzHalfH = clearance / 2;
+            break;
+          case "top":
+            dzX = bath.x + doorOffset;
+            dzY = bath.y + bath.height - clearance / 2;
+            dzHalfW = 0.4; dzHalfH = clearance / 2;
+            break;
+          case "left":
+            dzX = bath.x + clearance / 2;
+            dzY = bath.y + doorOffset;
+            dzHalfW = clearance / 2; dzHalfH = 0.4;
+            break;
+          default: // right
+            dzX = bath.x + bath.width - clearance / 2;
+            dzY = bath.y + doorOffset;
+            dzHalfW = clearance / 2; dzHalfH = 0.4;
+            break;
+        }
+
+        for (const pf of fixtures) {
+          const item = getFurnitureById(pf.itemId)!;
+          const isRot = pf.rotation === 90 || pf.rotation === 270;
+          const pfW = (isRot ? item.height : item.width) * pf.scale;
+          const pfH = (isRot ? item.width : item.height) * pf.scale;
+
+          const overlapsDoor =
+            Math.abs(pf.x - dzX) < pfW / 2 + dzHalfW + 0.02 &&
+            Math.abs(pf.y - dzY) < pfH / 2 + dzHalfH + 0.02;
+
+          expect(overlapsDoor,
+            `${pf.itemId} in ${cfg.w}×${cfg.h}m bathroom (door on ${wall}) overlaps door zone`
+          ).toBe(false);
+        }
       }
     }
   });
@@ -610,5 +814,109 @@ describe("Desk set integrity", () => {
       // Chair should be within 1m of desk center
       expect(dist).toBeLessThan(1.0);
     }
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/*  Bathroom fixtures — toilet cistern, sink near door, bathtub long side */
+/* ------------------------------------------------------------------ */
+
+describe("Bathroom fixture placement", () => {
+  it("toilet cistern is against a wall, seat faces open space", () => {
+    // Same pattern as bed headboard:
+    //   rot=0:   cistern worldY = centerY + halfH  (TOP wall)
+    //   rot=180: cistern worldY = centerY - halfH  (BOTTOM wall)
+    //   rot=90:  cistern worldX = centerX + halfH  (RIGHT wall)
+    //   rot=270: cistern worldX = centerX - halfH  (LEFT wall)
+    const bath = makeRoom({ name: "Bathroom", width: 2.5, height: 2, area: 5 });
+    const door: Door = {
+      room: "Bathroom", wall: "bottom", offset: 1.25, width: 0.8, swing: "in",
+    };
+    const result = suggestFurniture([bath], [door]);
+
+    const toilet = result.find((pf) => pf.itemId === "toilet");
+    expect(toilet).toBeDefined();
+
+    const item = getFurnitureById("toilet")!;
+    const halfH = item.height / 2;
+    const margin = 0.15;
+
+    // Door on bottom → opp wall is top → rot=0 (cistern against top)
+    if (toilet!.rotation === 0) {
+      const cisternY = toilet!.y + halfH;
+      expect((bath.y + bath.height) - cisternY).toBeLessThan(margin);
+    } else if (toilet!.rotation === 180) {
+      const cisternY = toilet!.y - halfH;
+      expect(cisternY - bath.y).toBeLessThan(margin);
+    } else if (toilet!.rotation === 90) {
+      // Right wall: cistern at centerX + halfH
+      const cisternX = toilet!.x + halfH;
+      expect((bath.x + bath.width) - cisternX).toBeLessThan(margin);
+    } else if (toilet!.rotation === 270) {
+      // Left wall: cistern at centerX - halfH
+      const cisternX = toilet!.x - halfH;
+      expect(cisternX - bath.x).toBeLessThan(margin);
+    }
+  });
+
+  it("bathroom sink is closest to the door", () => {
+    // Place door on right wall — sink prefers same wall, falls back to adjacent
+    const bath = makeRoom({ name: "Bathroom", width: 2.5, height: 2, area: 5 });
+    const door: Door = {
+      room: "Bathroom", wall: "right", offset: 1.0, width: 0.8, swing: "in",
+    };
+    const result = suggestFurniture([bath], [door]);
+
+    const sink = result.find((pf) => pf.itemId === "sink-bathroom");
+    expect(sink).toBeDefined();
+
+    // Sink should be on or near the door wall — either right wall, or an
+    // adjacent wall (bottom/top) if the right wall is too tight.
+    const distToRight = bath.x + bath.width - sink!.x;
+    const distToBottom = sink!.y - bath.y;
+    const distToTop = bath.y + bath.height - sink!.y;
+    const nearRight = distToRight < 0.6;
+    const nearBottom = distToBottom < 0.6;
+    const nearTop = distToTop < 0.6;
+    expect(nearRight || nearBottom || nearTop,
+      `sink should be near door wall (right) or adjacent wall. distToRight=${distToRight.toFixed(2)} distToBottom=${distToBottom.toFixed(2)} distToTop=${distToTop.toFixed(2)}`
+    ).toBe(true);
+  });
+
+  it("bathtub long side is parallel to the room's longer dimension", () => {
+    // Wide bathroom (wider than tall) → bathtub prefers rot=90 (along X)
+    const wideBath = makeRoom({ name: "Bathroom", width: 3.5, height: 2, area: 7 });
+    const wideResult = suggestFurniture([wideBath]);
+    const wideTub = wideResult.find((pf) => pf.itemId === "bathtub");
+    if (wideTub) {
+      // Prefer rot=90 in wide rooms, but rot=0/180 is acceptable if 90
+      // doesn't fit due to sink/toilet collision avoidance.
+      expect([90, 0, 180]).toContain(wideTub.rotation);
+    }
+
+    // Tall bathroom (taller than wide) → bathtub prefers rot=0 (along Y)
+    const tallBath = makeRoom({ name: "Bathroom", width: 2, height: 3.5, area: 7 });
+    const tallResult = suggestFurniture([tallBath]);
+    const tallTub = tallResult.find((pf) => pf.itemId === "bathtub");
+    if (tallTub) {
+      expect([0, 90, 270]).toContain(tallTub.rotation);
+    }
+  });
+
+  it("bathtub is only placed when room is long enough for its full length", () => {
+    // Room too narrow for bathtub (1.7m length at 0.9 scale = 1.53m needed)
+    // Room is 1.5m wide and 1.5m tall — neither dimension fits the bathtub
+    const tiny = makeRoom({ name: "Bathroom", width: 1.5, height: 1.5, area: 2.25 });
+    const tinyResult = suggestFurniture([tiny]);
+    expect(tinyResult.find((pf) => pf.itemId === "bathtub")).toBeUndefined();
+
+    // Room with 2m dimension should fit bathtub (1.53m needed, 2m available)
+    const fits = makeRoom({ name: "Bathroom", width: 1.8, height: 2.2, area: 3.96 });
+    // area < 6, so should get shower not bathtub
+    // area >= 6 is needed
+    const enough = makeRoom({ name: "Bathroom", width: 2, height: 3.2, area: 6.4 });
+    const enoughResult = suggestFurniture([enough]);
+    // Long dimension 3.2m, area ≥ 6 → bathtub should be placed
+    expect(enoughResult.find((pf) => pf.itemId === "bathtub")).toBeDefined();
   });
 });

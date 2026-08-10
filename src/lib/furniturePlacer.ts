@@ -1,6 +1,23 @@
 /* ------------------------------------------------------------------ */
 /*  Furniture Placer — intelligently places furniture in rooms         */
 /*  Based on room type, size, and furniture dimensions                 */
+/*                                                                     */
+/*  WALL-PLACEMENT ORIENTATION CONTRACT:                               */
+/*  For any object with its "back" at local y=0 (headboard, cistern,   */
+/*  wardrobe back, etc.) placed against a wall:                        */
+/*                                                                     */
+/*    rot=0:   local y=0 → worldY = centerY + halfH   (TOP wall)       */
+/*    rot=180: local y=0 → worldY = centerY - halfH   (BOTTOM wall)    */
+/*    rot=270: local y=0 → worldX = centerX - halfH   (LEFT wall)      */
+/*    rot=90:  local y=0 → worldX = centerX + halfH   (RIGHT wall)     */
+/*                                                                     */
+/*  Center position: wallEdge ± halfH ± margin                        */
+/*    TOP:    centerY = room.y + room.height - halfH - margin           */
+/*    BOTTOM: centerY = room.y + halfH + margin                         */
+/*    LEFT:   centerX = room.x + halfH + margin                         */
+/*    RIGHT:  centerX = room.x + room.width - halfH - margin            */
+/*                                                                     */
+/*  Tests in src/lib/__tests__/wallOrientation.ts enforce this.        */
 /* ------------------------------------------------------------------ */
 
 import { GeneratedRoom, Door, Window } from "./ai-client";
@@ -104,10 +121,11 @@ function overlapsObstruction(
 ): boolean {
   const margin = 0.05;
   for (const zone of zones) {
-    if (
-      Math.abs(itemX - zone.x) < itemHalfW + zone.halfW + margin &&
-      Math.abs(itemY - zone.y) < itemHalfH + zone.halfH + margin
-    ) {
+    // Use a tiny epsilon to prevent floating-point false positives at
+    // exact threshold boundaries (e.g. 0.700 < 0.700 can be true in IEEE 754).
+    const dx = Math.abs(itemX - zone.x) - (itemHalfW + zone.halfW + margin);
+    const dy = Math.abs(itemY - zone.y) - (itemHalfH + zone.halfH + margin);
+    if (dx < -1e-9 && dy < -1e-9) {
       return true;
     }
   }
@@ -333,13 +351,14 @@ function collidesWithExisting(
 /** Items in the same functional group can be placed adjacent (no collision check between them) */
 function sameGroup(id1: string, id2: string): boolean {
   const kitchenItems = ["kitchen-counter", "stove", "refrigerator", "kitchen-sink"]; // island excluded — must not overlap counter
-  const bathItems = ["toilet", "sink-bathroom", "bathtub", "shower"];
   const livingItems = ["sofa", "coffee-table", "tv-unit", "armchair", "side-table", "rug-large"];
   const bedItems = ["bed-", "side-table"]; // wardrobe intentionally excluded — must not overlap bed
   const diningItems = ["dining-table", "dining-chair"]; // table + chairs form a combined set
   const deskItems = ["desk", "office-chair"]; // desk + chair form a combined set
+  // Bathroom items NOT in sameGroup — toilet, sink, shower, and tub must
+  // respect normal collision margins to prevent door-zone and mutual overlap.
 
-  const groups = [kitchenItems, bathItems, livingItems, bedItems, diningItems, deskItems];
+  const groups = [kitchenItems, livingItems, bedItems, diningItems, deskItems];
   for (const group of groups) {
     const m1 = group.some(prefix => id1.includes(prefix));
     const m2 = group.some(prefix => id2.includes(prefix));
@@ -1021,6 +1040,22 @@ export function suggestFurniture(rooms: GeneratedRoom[], doors: Door[] = [], win
         if (extraIsland) placed.push(extraIsland);
       }
 
+      // Wall cabinets — above/beside the counter, avoiding doors/windows
+      if (cResult && rw >= 2.5) {
+        const cabObstZones = obstructionZonesByRoom.get(room.name) || [];
+        // Try walls adjacent to the counter wall first
+        const cabWalls: Door["wall"][] = counterWall === "bottom" || counterWall === "top"
+          ? ["left", "right", counterWall]
+          : ["top", "bottom", counterWall];
+        for (const cabWall of cabWalls) {
+          const cabRot = cabWall === "bottom" ? 0 : cabWall === "top" ? 180 : cabWall === "left" ? 90 : 270;
+          for (const cabScale of [0.8, 0.65]) {
+            const cabResult = wallPlace("cabinet", room, cabRot as 0 | 90 | 180 | 270, cabScale, placed, cabObstZones);
+            if (cabResult) { placed.push(cabResult); break; }
+          }
+        }
+      }
+
       // Dining nook — only if table fits via smartPlace, then chairs
       if (roomArea >= 16 && rw >= 3 && rh >= 3.5) {
         const tableResult = smartPlace("dining-table-4", room,
@@ -1046,49 +1081,232 @@ export function suggestFurniture(rooms: GeneratedRoom[], doors: Door[] = [], win
 
     /* ---- BATHROOM — spaced fixtures, no overlap ---- */
     if (/bathroom|ensuite|powder|wc/i.test(name)) {
-      const isLarge = roomArea >= 6;
+      const bathDoors = doors.filter((d) => d.room === room.name);
+      const mainDoor = bathDoors.find((d) => d.width >= 0.6) ?? bathDoors[0];
+      const doorWall: Door["wall"] = mainDoor?.wall ?? "bottom";
+      const bathObstZones = obstructionZonesByRoom.get(room.name) || [];
 
-      // Toilet — back-left corner (cistern against back wall)
-      placed.push({
-        itemId: "toilet",
-        room: room.name,
-        x: room.x + rw * 0.22,
-        y: room.y + rh * 0.22,
-        rotation: 0,
-        scale: 1.0,
-      });
+      // ── Toilet: cistern against a wall, seat into room ──
+      // Same pattern as bed headboard (bedY = backWall - halfH - margin).
+      // local y=0 (cistern) → world position by rotation:
+      //   rot=0:   worldY = centerY + halfH  → for TOP wall
+      //   rot=180: worldY = centerY - halfH  → for BOTTOM wall
+      //   rot=90:  worldX = centerX + halfH  → for RIGHT wall
+      //   rot=270: worldX = centerX - halfH  → for LEFT wall
+      const toiletItem = getFurnitureById("toilet");
+      const tHalf = toiletItem ? toiletItem.height / 2 : 0.35;
+      const tMargin = 0.05;
 
-      // Sink — centred on the opposite wall from toilet, well clear of door zones.
-      // For tiny ensuites, push it to the middle of the wall to avoid window/door edges.
-      const sinkX = roomArea < 5 ? room.x + rw * 0.5 : room.x + rw * 0.78;
-      placed.push({
-        itemId: "sink-bathroom",
-        room: room.name,
-        x: sinkX,
-        y: room.y + rh * 0.2,
-        rotation: 0,
-        scale: 1.0,
-      });
+      // Try all 4 walls — prefer opposite door, then any that fits
+      const wallPriority: Array<{ wall: Door["wall"]; rot: number; cx: number; cy: number }> = [];
+      const oppWall = doorWall === "bottom" ? "top" : doorWall === "top" ? "bottom"
+        : doorWall === "left" ? "right" : "left";
 
-      // Bathtub or shower — placed along back wall, to the right, AWAY from toilet
-      if (isLarge) {
-        placed.push({
-          itemId: "bathtub",
-          room: room.name,
-          x: room.x + rw * 0.75,
-          y: room.y + rh * 0.72,
-          rotation: 0,
-          scale: 0.9,
-        });
+      const wallConfigs: Array<{ wall: Door["wall"]; rot: number }> = [
+        { wall: "top",    rot: 0 },
+        { wall: "bottom", rot: 180 },
+        { wall: "left",   rot: 270 },   // cistern at centerX - halfH → toward left wall
+        { wall: "right",  rot: 90 },    // cistern at centerX + halfH → toward right wall
+      ];
+
+      // Put opposite-door wall first
+      const oppIdx = wallConfigs.findIndex(c => c.wall === oppWall);
+      if (oppIdx > 0) {
+        const [opp] = wallConfigs.splice(oppIdx, 1);
+        wallConfigs.unshift(opp);
+      }
+
+      let toiletPlaced = false;
+      for (const { wall, rot } of wallConfigs) {
+        let tx: number, ty: number;
+        switch (wall) {
+          case "top":    tx = room.x + rw * 0.35; ty = room.y + rh - tHalf - tMargin; break;
+          case "bottom": tx = room.x + rw * 0.35; ty = room.y + tHalf + tMargin; break;
+          case "left":   tx = room.x + tHalf + tMargin; ty = room.y + rh * 0.55; break;
+          case "right":  tx = room.x + rw - tHalf - tMargin; ty = room.y + rh * 0.55; break;
+          default: continue;
+        }
+
+        const isTRot = rot === 90 || rot === 270;
+        const tiw = isTRot ? (toiletItem?.height ?? 0.7) : (toiletItem?.width ?? 0.45);
+        const tih = isTRot ? (toiletItem?.width ?? 0.45) : (toiletItem?.height ?? 0.7);
+
+        if (isFurnitureInBounds(tx, ty, tiw, tih, room) &&
+            !collidesWithExisting(tx, ty, tiw, tih, room.name, placed, "toilet")) {
+          placed.push({ itemId: "toilet", room: room.name, x: tx, y: ty, rotation: rot as 0 | 90 | 180 | 270, scale: 1.0 });
+          toiletPlaced = true;
+          break;
+        }
+      }
+      // Absolute fallback
+      if (!toiletPlaced) {
+        placed.push({ itemId: "toilet", room: room.name, x: room.x + rw * 0.22, y: room.y + rh * 0.22, rotation: 0, scale: 1.0 });
+      }
+
+      // ── Sink: closest to the door, but not overlapping the door swing ──
+      // Place on same wall as door; if the sink can't fit on that wall
+      // without overlapping the door zone, try adjacent walls.
+      const sinkItem = getFurnitureById("sink-bathroom");
+      const sinkHalfAlong = sinkItem ? sinkItem.width / 2 + 0.1 : 0.4;
+
+      let sinkPlaced = false;
+      // Try door wall first, then adjacent walls
+      const sinkWallOrder: Door["wall"][] = [doorWall];
+      if (doorWall === "bottom" || doorWall === "top") {
+        sinkWallOrder.push("left", "right");
       } else {
-        placed.push({
-          itemId: "shower",
-          room: room.name,
-          x: room.x + rw * 0.72,
-          y: room.y + rh * 0.68,
-          rotation: 0,
-          scale: 0.85,
-        });
+        sinkWallOrder.push("bottom", "top");
+      }
+
+      for (const tryWall of sinkWallOrder) {
+        let sx: number, sy: number, sr: number;
+        const alongDim = (tryWall === "top" || tryWall === "bottom") ? rw : rh;
+        const doorAlong = (mainDoor && mainDoor.wall === tryWall) ? mainDoor.offset : alongDim * 0.5;
+        const doorHalf = (tryWall === mainDoor?.wall ? (mainDoor.width / 2 + 0.2) : 0.25);
+
+        // Compute free spaces on either side of door.
+        // "Left" = towards 0 along the wall, "Right" = towards alongDim.
+        // Check if the sink CENTER can fit on each side of the door zone.
+        const minGap = 0.02;
+        const sinkSpan = sinkHalfAlong * 2; // total space sink occupies along the wall
+        const doorZoneStart = doorAlong - doorHalf;
+        const doorZoneEnd = doorAlong + doorHalf;
+
+        // Sink on the "left" side (towards 0): center at doorZoneStart - sinkHalfAlong - minGap
+        const leftCenter = doorZoneStart - sinkHalfAlong - minGap;
+        const leftFits = leftCenter - sinkHalfAlong >= 0;
+
+        // Sink on the "right" side (towards alongDim): center at doorZoneEnd + sinkHalfAlong + minGap
+        const rightCenter = doorZoneEnd + sinkHalfAlong + minGap;
+        const rightFits = rightCenter + sinkHalfAlong <= alongDim;
+
+        let along: number;
+        if (leftFits) {
+          along = leftCenter;
+        } else if (rightFits) {
+          along = rightCenter;
+        } else if (tryWall === mainDoor?.wall) {
+          // Door wall is too tight — skip to adjacent wall
+          continue;
+        } else {
+          // Non-door wall: place at the far end from room center
+          along = doorAlong < alongDim / 2 ? alongDim - sinkHalfAlong - 0.05 : sinkHalfAlong + 0.05;
+        }
+        along = Math.max(sinkHalfAlong + 0.05, Math.min(alongDim - sinkHalfAlong - 0.05, along));
+
+        switch (tryWall) {
+          case "bottom": sx = room.x + along; sy = room.y + 0.3; sr = 0; break;
+          case "top":    sx = room.x + along; sy = room.y + rh - 0.3; sr = 180; break;
+          case "left":   sx = room.x + 0.3; sy = room.y + along; sr = 90; break;
+          default:       sx = room.x + rw - 0.3; sy = room.y + along; sr = 270; break;
+        }
+
+        const isRot = sr === 90 || sr === 270;
+        const siw = isRot ? (sinkItem?.height ?? 0.5) : (sinkItem?.width ?? 0.6);
+        const sih = isRot ? (sinkItem?.width ?? 0.6) : (sinkItem?.height ?? 0.5);
+
+        if (isFurnitureInBounds(sx, sy, siw, sih, room) &&
+            !collidesWithExisting(sx, sy, siw, sih, room.name, placed, "sink-bathroom") &&
+            !overlapsObstruction(sx, sy, siw / 2, sih / 2, bathObstZones)) {
+          placed.push({ itemId: "sink-bathroom", room: room.name, x: sx, y: sy, rotation: sr as 0 | 90 | 180 | 270, scale: 1.0 });
+          sinkPlaced = true;
+          break;
+        }
+      }
+      // Absolute fallback
+      if (!sinkPlaced) {
+        placed.push({ itemId: "sink-bathroom", room: room.name, x: room.x + rw * 0.5, y: room.y + rh * 0.5, rotation: 0, scale: 1.0 });
+      }
+
+      // ── Bathtub or shower ──
+      // Bathtub (0.75×1.7m) parallel to room's LONGER side.
+      // Try multiple positions along the long walls — don't hardcode one spot.
+      const bathtub = getFurnitureById("bathtub");
+      const roomLongDim = Math.max(rw, rh);
+      const bathtubLength = bathtub ? bathtub.height * 0.9 : 1.53;
+      const canFitBathtub = roomLongDim >= bathtubLength + 0.3 && roomArea >= 6;
+
+      let tubOrShowerPlaced = false;
+
+      if (canFitBathtub && bathtub) {
+        // Try preferred rotation first, then alternate if door zone blocks it
+        const prefRot = rw >= rh ? (90 as const) : (0 as const);
+        const altRot = prefRot === 90 ? (0 as const) : (90 as const);
+        const bScale = 0.9;
+
+        for (const tryRot of [prefRot, altRot]) {
+          const btw = tryRot === 90 ? bathtub.height : bathtub.width;
+          const bth = tryRot === 90 ? bathtub.width : bathtub.height;
+
+          const positions: Array<{ x: number; y: number }> = [];
+          if (tryRot === 90) {
+            for (const yFrac of [0.25, 0.5, 0.7]) {
+              positions.push(
+                { x: room.x + rw * 0.2, y: room.y + rh * yFrac },
+                { x: room.x + rw * 0.8, y: room.y + rh * yFrac },
+              );
+            }
+            positions.push({ x: room.x + rw * 0.5, y: room.y + rh * 0.5 });
+          } else {
+            for (const xFrac of [0.25, 0.5, 0.7]) {
+              positions.push(
+                { x: room.x + rw * xFrac, y: room.y + rh * 0.2 },
+                { x: room.x + rw * xFrac, y: room.y + rh * 0.8 },
+              );
+            }
+            positions.push({ x: room.x + rw * 0.5, y: room.y + rh * 0.5 });
+          }
+
+          for (const pos of positions) {
+            if (isFurnitureInBounds(pos.x, pos.y, btw * bScale, bth * bScale, room) &&
+                !collidesWithExisting(pos.x, pos.y, btw * bScale, bth * bScale, room.name, placed, "bathtub") &&
+                !overlapsObstruction(pos.x, pos.y, (btw * bScale) / 2, (bth * bScale) / 2, bathObstZones)) {
+              placed.push({ itemId: "bathtub", room: room.name, x: pos.x, y: pos.y, rotation: tryRot as 0 | 90 | 180 | 270, scale: bScale });
+              tubOrShowerPlaced = true;
+              break;
+            }
+          }
+          if (tubOrShowerPlaced) break;
+
+          for (const s of [0.85, 0.75]) {
+            const btResult = smartPlace("bathtub", room, room.x + rw * 0.5, room.y + rh * 0.5, tryRot, s, placed, bathObstZones);
+            if (btResult) { placed.push(btResult); tubOrShowerPlaced = true; break; }
+          }
+          if (tubOrShowerPlaced) break;
+        }
+      }
+
+      // Fallback: shower if bathtub didn't fit (or room too small)
+      if (!tubOrShowerPlaced) {
+        // Try smartPlace at multiple positions before failing
+        const showerPositions = [
+          { x: room.x + rw * 0.25, y: room.y + rh * 0.3 },
+          { x: room.x + rw * 0.75, y: room.y + rh * 0.3 },
+          { x: room.x + rw * 0.25, y: room.y + rh * 0.7 },
+          { x: room.x + rw * 0.75, y: room.y + rh * 0.7 },
+          { x: room.x + rw * 0.5,  y: room.y + rh * 0.5 },
+          // Corners
+          { x: room.x + 0.5, y: room.y + 0.5 },
+          { x: room.x + rw - 0.5, y: room.y + 0.5 },
+          { x: room.x + 0.5, y: room.y + rh - 0.5 },
+          { x: room.x + rw - 0.5, y: room.y + rh - 0.5 },
+        ];
+
+        let shResult: PlacedFurniture | null = null;
+        for (const pos of showerPositions) {
+          for (const s of [0.85, 0.7, 0.6, 0.5]) {
+            shResult = smartPlace("shower", room, pos.x, pos.y, 0, s, placed, bathObstZones);
+            if (shResult) break;
+          }
+          if (shResult) break;
+        }
+
+        if (shResult) {
+          placed.push(shResult);
+        } else {
+          // Absolute last resort — center at minimum viable scale
+          placed.push({ itemId: "shower", room: room.name, x: room.x + rw * 0.5, y: room.y + rh * 0.5, rotation: 0, scale: 0.5 });
+        }
       }
     }
 
@@ -1247,15 +1465,13 @@ export function suggestFurniture(rooms: GeneratedRoom[], doors: Door[] = [], win
   const essentialIds = new Set([
     "bed-single", "bed-double", "bed-queen", "bed-king",
     "dining-table-4", "dining-table-6",
-    "toilet", "sink-bathroom", "shower",
+    "toilet", "sink-bathroom", "shower", "bathtub",
     "stove-4-burner", "refrigerator", "kitchen-sink",
     "kitchen-counter-straight", "kitchen-counter-small", "kitchen-counter-corner", "kitchen-island",
     "wardrobe", "desk",
     // Living room core: sofa + rug + TV are the highest-priority decor items
     "sofa-3-seater", "sofa-2-seater", "tv-unit", "rug-large",
   ]);
-  // Note: "bathtub" NOT in essentialIds — it gets full bounds check;
-  // if it doesn't fit even after smartPlace, shower is substituted below
 
   // Items that MUST appear — if smartPlace fails, compute fitting scale
   const forceItems = new Set([
@@ -1264,6 +1480,8 @@ export function suggestFurniture(rooms: GeneratedRoom[], doors: Door[] = [], win
     "wardrobe",
     // Living room core items always appear
     "sofa-3-seater", "sofa-2-seater", "tv-unit", "rug-large",
+    // Bathroom essentials: shower and bathtub MUST be placed if attempted
+    "shower", "bathtub",
   ]);
 
   const validated: PlacedFurniture[] = [];
@@ -1351,55 +1569,143 @@ export function suggestFurniture(rooms: GeneratedRoom[], doors: Door[] = [], win
         const guaranteed = guaranteedPlace(pf.itemId, room, validated);
         if (guaranteed) validated.push(guaranteed);
       }
-    } else if (pf.itemId === "bathtub") {
-      // Bathtub doesn't fit — try a shower instead
-      const showerFix = smartPlace("shower", room, pf.x, pf.y, pf.rotation, 0.9, validated);
-      if (showerFix) {
-        validated.push(showerFix);
-      }
     }
     // Non-essential items that don't fit: just skip them
+  }
+
+  // ── Bathroom invariant: every bathroom/ensuite/powder/WC MUST have ──
+  //    toilet + sink + (shower OR bathtub). These are non-negotiable.
+  //    Force-place any missing fixture. Warn if undersized but never strip.
+  const BATH_MIN_SCALE = 0.4; // smallest functional fixture (34cm shower)
+  const bathroomFixtureIds = new Set(["toilet", "sink-bathroom", "shower", "bathtub"]);
+  const bathroomRoomNames = new Set(
+    rooms.filter(r => /bathroom|ensuite|powder|wc/i.test(r.name)).map(r => r.name)
+  );
+
+  for (const roomName of bathroomRoomNames) {
+    const room = roomMap.get(roomName);
+    if (!room) continue;
+
+    const roomFixtures = validated.filter(
+      pf => pf.room === roomName && bathroomFixtureIds.has(pf.itemId)
+    );
+    let hasToilet = roomFixtures.some(pf => pf.itemId === "toilet");
+    let hasSink = roomFixtures.some(pf => pf.itemId === "sink-bathroom");
+    let tubOrShower = roomFixtures.find(pf => pf.itemId === "shower" || pf.itemId === "bathtub");
+    let hasTubOrShower = !!tubOrShower;
+
+    // Force-place any missing mandatory fixture at minimum viable scale
+    if (!hasToilet) {
+      const forced = guaranteedPlace("toilet", room, validated, BATH_MIN_SCALE);
+      if (forced) { validated.push(forced); hasToilet = true; }
+    }
+    if (!hasSink) {
+      const forced = guaranteedPlace("sink-bathroom", room, validated, BATH_MIN_SCALE);
+      if (forced) { validated.push(forced); hasSink = true; }
+    }
+    if (!hasTubOrShower) {
+      const forced = guaranteedPlace("shower", room, validated, BATH_MIN_SCALE)
+                  ?? guaranteedPlace("bathtub", room, validated, BATH_MIN_SCALE);
+      if (forced) { validated.push(forced); hasTubOrShower = true; tubOrShower = forced; }
+    }
+
+    // Replace undersized shower/tub — smartPlace may have shrunk it below minimum
+    tubOrShower = validated.find(pf =>
+      pf.room === roomName && (pf.itemId === "shower" || pf.itemId === "bathtub")
+    );
+    if (tubOrShower && tubOrShower.scale < BATH_MIN_SCALE) {
+      // Remove the tiny one and force-place at proper minimum
+      const idx = validated.indexOf(tubOrShower);
+      if (idx >= 0) validated.splice(idx, 1);
+      const forced = guaranteedPlace("shower", room, validated, BATH_MIN_SCALE)
+                  ?? guaranteedPlace("bathtub", room, validated, BATH_MIN_SCALE);
+      if (forced) { validated.push(forced); tubOrShower = forced; }
+    }
   }
 
   return validated;
 }
 
 /**
- * Guaranteed placement: finds the maximum scale that fits at room center.
- * Only for truly critical items (toilet, kitchen counter, stove).
+ * Guaranteed placement: finds the maximum scale that fits at room center,
+ * then tries corners and wall-edge positions as fallback.
+ * Only for truly critical items (toilet, kitchen counter, stove, shower).
  */
 function guaranteedPlace(
   itemId: string,
   room: GeneratedRoom,
-  existing: PlacedFurniture[]
+  existing: PlacedFurniture[],
+  minScale?: number
 ): PlacedFurniture | null {
   const item = getFurnitureById(itemId);
   if (!item) return null;
 
+  const isBathFixture = ["toilet", "sink-bathroom", "shower", "bathtub"].includes(itemId);
+  // Bathroom fixtures: floor 0.4 (34cm) — recognizable minimum.
+  // Other critical items: floor 0.2 as absolute last resort.
+  const floor = minScale ?? (isBathFixture ? 0.4 : 0.2);
+
   const centroid = getRoomCentroid(room);
 
-  // Try scales from 100% down to 25% in steps
-  for (const scale of [1.0, 0.85, 0.7, 0.55, 0.4, 0.3, 0.25]) {
+  // Try centroid first, then corners, then wall-edge positions
+  const positions = [
+    { x: centroid.x, y: centroid.y },
+    // Corners
+    { x: room.x + 0.5, y: room.y + 0.5 },
+    { x: room.x + room.width - 0.5, y: room.y + 0.5 },
+    { x: room.x + 0.5, y: room.y + room.height - 0.5 },
+    { x: room.x + room.width - 0.5, y: room.y + room.height - 0.5 },
+    // Mid-wall positions
+    { x: room.x + room.width * 0.5, y: room.y + 0.5 },
+    { x: room.x + 0.5, y: room.y + room.height * 0.5 },
+    { x: room.x + room.width - 0.5, y: room.y + room.height * 0.5 },
+    { x: room.x + room.width * 0.5, y: room.y + room.height - 0.5 },
+  ];
+
+  // Build scale ladder from 1.0 down to floor
+  const scales: number[] = [];
+  for (const s of [1.0, 0.85, 0.7, 0.55, 0.4, 0.3, 0.25, 0.2]) {
+    if (s >= floor - 0.001) scales.push(s);
+  }
+  if (scales.length === 0 || scales[scales.length - 1] > floor) {
+    scales.push(floor);
+  }
+
+  for (const scale of scales) {
     for (const rot of [0, 90]) {
       const iw = (rot === 0 ? item.width : item.height) * scale;
       const ih = (rot === 0 ? item.height : item.width) * scale;
 
-      if (isFurnitureInBounds(centroid.x, centroid.y, iw, ih, room) &&
-          !collidesWithExisting(centroid.x, centroid.y, iw, ih, room.name, existing, itemId)) {
-        return { itemId, room: room.name, x: centroid.x, y: centroid.y, rotation: rot as 0 | 90 | 180 | 270, scale };
+      for (const pos of positions) {
+        if (isFurnitureInBounds(pos.x, pos.y, iw, ih, room) &&
+            !collidesWithExisting(pos.x, pos.y, iw, ih, room.name, existing, itemId)) {
+          return { itemId, room: room.name, x: pos.x, y: pos.y, rotation: rot as 0 | 90 | 180 | 270, scale };
+        }
+      }
+    }
+    // For scales <= 0.5, also try all 4 rotations
+    if (scale <= 0.5) {
+      for (const rot of [180, 270]) {
+        const iw = (rot === 90 || rot === 270 ? item.height : item.width) * scale;
+        const ih = (rot === 90 || rot === 270 ? item.width : item.height) * scale;
+        for (const pos of positions) {
+          if (isFurnitureInBounds(pos.x, pos.y, iw, ih, room) &&
+              !collidesWithExisting(pos.x, pos.y, iw, ih, room.name, existing, itemId)) {
+            return { itemId, room: room.name, x: pos.x, y: pos.y, rotation: rot as 0 | 90 | 180 | 270, scale };
+          }
+        }
       }
     }
   }
 
-  // Absolute last resort: 20% scale
-  const minScale = 0.2;
+  // Absolute last resort: floor scale at centroid
   return {
     itemId,
     room: room.name,
     x: centroid.x,
     y: centroid.y,
     rotation: 0,
-    scale: minScale,
+    scale: floor,
   };
 }
 
