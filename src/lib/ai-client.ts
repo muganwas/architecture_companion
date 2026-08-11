@@ -55,6 +55,8 @@ export interface GeneratedRoom {
   shape?: "rectangle" | "l-shape" | "bay-window" | "angled-corner" | "polygon";
   /** Optional display override (e.g., "I.Hallway" for apartment interior hallways) */
   displayLabel?: string;
+  /** True when this room absorbs a kitchen zone (kitchen area/kitchenette/cooking area) */
+  hasKitchenZone?: boolean;
 }
 
 export interface Door {
@@ -280,10 +282,17 @@ function validateRoomPlacement(
   // ── 0. Check if total area is unreasonably small ──
   // Studios are exempt — they are naturally compact (25-40m²)
   const isStudioPlan = /studio/i.test(desc) || Object.values(plan.zones).flat().some(n => /studio/i.test(n));
-  if (plan.totalArea < 60 && !isStudioPlan) {
+  // 1-bedroom homes are compact (35-60m²) — different limits than 2+ bedroom
+  const wordNums: Record<string, string> = { one: "1", two: "2", three: "3", four: "4", five: "5" };
+  const bedMatch = desc.match(/(\d+|one|two|three|four|five)\s*-?\s*bed(?:room)?/i);
+  const bedCount = bedMatch ? (wordNums[bedMatch[1].toLowerCase()] || bedMatch[1]) : null;
+  const isOneBed = bedCount === "1";
+  const minArea = isOneBed ? 35 : 60;
+  const defaultArea = isOneBed ? 45 : 100;
+  if (plan.totalArea < minArea && !isStudioPlan) {
     warnings.push(
-      `⚠️ The generated plan has only ${plan.totalArea}m² total area (minimum usable is 60m²). ` +
-      `The layout has been scaled up to 100m². Please specify a larger area in your description (e.g., "100 square meters").`
+      `⚠️ The generated plan has only ${plan.totalArea}m² total area (minimum usable is ${minArea}m²). ` +
+      `The layout has been scaled up to ${defaultArea}m². Please specify a larger area in your description (e.g., "${defaultArea} square meters").`
     );
   }
 

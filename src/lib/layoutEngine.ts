@@ -62,7 +62,7 @@ export function computeLayout(plan: AbstractPlan, options?: LayoutOptions): Layo
     if (totalArea > 40) { console.warn(`Layout engine: studio capped from ${totalArea}m² to 40m²`); totalArea = 40; }
     if (totalArea < 20) totalArea = 25; // cozy default
   } else if (totalBeds === 1) {
-    if (totalArea > 65) { console.warn(`Layout engine: 1-bedroom capped from ${totalArea}m² to 65m²`); totalArea = 65; }
+    if (totalArea > 60) { console.warn(`Layout engine: 1-bedroom capped from ${totalArea}m² to 60m²`); totalArea = 60; }
     if (totalArea < 35) totalArea = 45; // comfortable default
   } else {
     // 2+ bedrooms: use user-specified area with normal min/max
@@ -199,27 +199,6 @@ export function computeLayout(plan: AbstractPlan, options?: LayoutOptions): Layo
 
   // Step 3: Place rooms in columns with balanced proportions
   const minRoomWidth = 2.2; // minimum room width in meters (fits a bed)
-
-  /**
-   * Returns a priority score for room size ordering.
-   * Low score = small rooms placed first (bathroom, laundry, office, ensuite).
-   * High score = large rooms placed last (master, living, kitchen, garage, dining).
-   * Large rooms get the column's remaining space benefit.
-   */
-  function roomSizePriority(name: string): number {
-    const n = name.toLowerCase();
-    if (/bathroom|ensuite|wc|toilet|powder/i.test(n) && !/master/i.test(n)) return 0;
-    if (/laundry|utility|pantry|closet/i.test(n)) return 1;
-    if (/office|study|den/i.test(n)) return 2;
-    if (/bedroom/i.test(n) && !/master/i.test(n)) return 3;
-    if (/hallway|corridor/i.test(n)) return 4;
-    if (/dining/i.test(n)) return 5;
-    if (/kitchen/i.test(n)) return 6;
-    if (/living|lounge|family/i.test(n)) return 7;
-    if (/garage/i.test(n)) return 8;
-    if (/master/i.test(n)) return 9;
-    return 5; // default mid-priority
-  }
 
   function placeColumnBalanced(
     names: string[],
@@ -376,8 +355,43 @@ export function computeLayout(plan: AbstractPlan, options?: LayoutOptions): Layo
   }
 
   // ── Balance columns: ensure rooms are distributed across both sides ──
-  // Prevents scenarios where all rooms pile up on one side of the hallway.
-  balanceColumns(zones);
+  // Only skip for hub-and-spoke (living room as central hub).
+  // Studios still need balancing to distribute rooms properly.
+  const allRoomNamesPre = Object.values(zones).flat().filter(n => !/porch|balcony/i.test(n));
+  const isHubPre = skipHallway && !isStudio && allRoomNamesPre.some(n => /living|lounge|family/i.test(n)) && allRoomNamesPre.length >= 3;
+  if (!isHubPre) balanceColumns(zones);
+
+  // Determine if this is a hub-and-spoke layout: small home (no hallway, not studio)
+  // where the living room serves as the central circulation space.
+  const allRoomNames = Object.values(zones).flat().filter(n => !/porch|balcony/i.test(n));
+  const hasLivingRoom = allRoomNames.some(n => /living|lounge|family/i.test(n));
+  const useHubAndSpoke = skipHallway && !isStudio && hasLivingRoom && allRoomNames.length >= 3;
+
+  if (useHubAndSpoke) {
+    console.log(`[layout] hub-and-spoke — living room as central hub for ${allRoomNames.length} rooms`);
+    placeHubAndSpoke(rooms, zones, interiorRatios, totalArea, buildingW, buildingH);
+  } else {
+  // ── Merge kitchen zones into living room (hub-and-spoke only) ──
+  // Studios already handle kitchens in the furniture placer.
+  if (useHubAndSpoke) {
+    for (const zoneKey of Object.keys(zones)) {
+      const arr = (zones as Record<string, string[]>)[zoneKey];
+      if (!arr) continue;
+      for (let i = arr.length - 1; i >= 0; i--) {
+        const lower = arr[i].toLowerCase();
+        const isKitchenZone = /kitchen|cooking|kitchenette/i.test(lower);
+        if (isKitchenZone) {
+          // Find living room to merge into
+          const livingName = arr.find(n => /living|lounge|family/i.test(n))
+            || Object.values(zones).flat().find(n => /living|lounge|family/i.test(n));
+          if (livingName) {
+            interiorRatios[livingName] = (interiorRatios[livingName] || 0) + (interiorRatios[arr[i]] || 0);
+          }
+          arr.splice(i, 1);
+        }
+      }
+    }
+  }
 
   // Place left column rooms — front→back: front rooms at bottom (y=0), back rooms at top
   // Porch and Balcony are exterior extensions only, never regular rooms
@@ -403,6 +417,19 @@ export function computeLayout(plan: AbstractPlan, options?: LayoutOptions): Layo
     rightEndY = placeColumnBalanced(rightRooms, rightZoneX, rightZoneWidth, polyBounds.y, polyBounds.y + buildingH);
   }
 
+  // ── Post-process: merge split columns in compact (no-hallway) layouts ──
+  // When skipHallway is true and rooms end up on BOTH sides, they form two
+  // disconnected building blocks. Shift right-column rooms into the left
+  // column so the floor plan is one contiguous building.
+  if (skipHallway && leftRooms.length > 0 && rightRooms.length > 0) {
+    const leftRoomNames = new Set(leftRooms.map(n => n.toLowerCase()));
+    for (const room of rooms) {
+      if (leftRoomNames.has(room.name.toLowerCase())) continue;
+      room.x = polyBounds.x;
+      room.width = buildingW;
+    }
+  }
+
   // ── Cap hallway height to the tallest column ── (no wasted hallway past last room)
   const maxEndY = Math.max(leftEndY, rightEndY);
   hallway.height = maxEndY - polyBounds.y;
@@ -419,6 +446,8 @@ export function computeLayout(plan: AbstractPlan, options?: LayoutOptions): Layo
   // stretches its rooms to fill the hallway height — no dead space.
   enforceZeroGapAdjacency(rooms, leftZoneX, leftZoneWidth, polyBounds.y, maxEndY, totalArea);
   enforceZeroGapAdjacency(rooms, rightZoneX, rightZoneWidth, polyBounds.y, maxEndY, totalArea);
+
+  } // end else (column layout)
 
   // ── Post-processing: carve ensuite from master bedroom ──
   // Only carve if the LLM's abstract plan explicitly includes an Ensuite.
@@ -468,21 +497,9 @@ export function computeLayout(plan: AbstractPlan, options?: LayoutOptions): Layo
   // Step 7: Apply creative shapes post-processing (interior shapes only)
   applyCreativeShapes(rooms, plan.roomShapes || {}, buildingW, buildingH);
 
-  // Build perimeter polygon from room extents (rooms define the house, not vice versa)
-  const extents = rooms.reduce((acc, r) => {
-    const rx = r.x, ry = r.y, rw = r.width, rh = r.height;
-    if (rx < acc.minX) acc.minX = rx;
-    if (ry < acc.minY) acc.minY = ry;
-    if (rx + rw > acc.maxX) acc.maxX = rx + rw;
-    if (ry + rh > acc.maxY) acc.maxY = ry + rh;
-    return acc;
-  }, { minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity });
-  const buildingPoly = [
-    { x: extents.minX, y: extents.minY },
-    { x: extents.maxX, y: extents.minY },
-    { x: extents.maxX, y: extents.maxY },
-    { x: extents.minX, y: extents.maxY },
-  ];
+  // Build perimeter polygon that traces actual room edges (L-shape, T-shape, etc.)
+  // rather than a simple bounding rectangle that includes empty gaps.
+  const buildingPoly = traceBuildingOutline(rooms);
 
   return { rooms, doors, windows, buildingPolygon: buildingPoly,
     entranceApproach: computeEntranceApproach(rooms, mainEntranceDoors, isGroundFloor),
@@ -492,6 +509,282 @@ export function computeLayout(plan: AbstractPlan, options?: LayoutOptions): Layo
 /* ------------------------------------------------------------------ */
 /*  Creative shape post-processing                                     */
 /* ------------------------------------------------------------------ */
+
+/* ------------------------------------------------------------------ */
+/*  Hub-and-spoke layout — living room as central circulation space   */
+/* ------------------------------------------------------------------ */
+
+/**
+ * For small homes (1-bed, no hallway), place the living room centrally
+ * and arrange other rooms around it. All rooms connect through the living
+ * room — no corridor needed. Building shape follows room arrangement.
+ */
+function placeHubAndSpoke(
+  rooms: GeneratedRoom[],
+  zones: AbstractPlan["zones"],
+  ratios: Record<string, number>,
+  totalArea: number,
+  buildingW: number,
+  buildingH: number
+): void {
+  const allNames = Object.values(zones).flat().filter(n => !/porch|balcony/i.test(n));
+  const livingName = allNames.find(n => /living|lounge|family/i.test(n)) || allNames[0];
+
+  // In hub-and-spoke layouts, ALL kitchens are open-plan zones within
+  // the living room — regardless of exact name. The AI may normalize
+  // "cooking area" → "Kitchen", so name-based heuristics are unreliable.
+  const kitchenZoneNames = allNames.filter(n =>
+    /kitchen|cooking|kitchenette/i.test(n)
+  );
+  for (const kn of kitchenZoneNames) {
+    ratios[livingName] = (ratios[livingName] || 0) + (ratios[kn] || 0);
+  }
+  const otherNames = allNames.filter(n => n !== livingName && !kitchenZoneNames.includes(n));
+
+  // ── Living room: central square (includes kitchen zone) ──
+  const liveRatio = ratios[livingName] || 0.35;
+  const otherRatioSum = otherNames.reduce((s, n) => s + (ratios[n] || 0), 0);
+  const totalRatio = liveRatio + otherRatioSum;
+  const liveFrac = totalRatio > 0 ? liveRatio / totalRatio : 0.4;
+
+  // Living room gets a squarish shape in the center
+  const liveArea = totalArea * liveFrac;
+  const liveSide = Math.sqrt(liveArea);
+  const liveW = Math.max(3.5, Math.min(liveSide * 1.2, buildingW * 0.7));
+  const liveH = Math.max(3.0, liveArea / liveW);
+
+  // Center the living room
+  const liveX = (buildingW - liveW) / 2;
+  const liveY = (buildingH - liveH) / 2;
+
+  rooms.push({
+    name: livingName,
+    x: parseFloat(liveX.toFixed(2)),
+    y: parseFloat(liveY.toFixed(2)),
+    width: parseFloat(liveW.toFixed(2)),
+    height: parseFloat(liveH.toFixed(2)),
+    area: parseFloat((liveW * liveH).toFixed(1)),
+    hasKitchenZone: kitchenZoneNames.length > 0,
+  });
+
+  if (otherNames.length === 0) return;
+
+  // ── Place other rooms around the living room ──
+  // Reserve the bottom/front side for the main entrance.
+  // Assign rooms to left, right, top only (bottom stays open for exterior access).
+  const sides: Array<{ wall: "left" | "right" | "top" | "bottom"; name: string }> = [];
+  const usedSides = new Set<string>();
+
+  for (const name of otherNames) {
+    const n = name.toLowerCase();
+    let preferred: string[];
+    if (/bedroom|master/i.test(n)) {
+      preferred = ["left", "top"];
+    } else if (/kitchen|cooking|kitchenette/i.test(n)) {
+      preferred = ["right", "top"];
+    } else if (/bathroom|ensuite|wc|toilet|powder/i.test(n)) {
+      preferred = ["top", "right"];
+    } else {
+      preferred = ["left", "right", "top"];
+    }
+
+    let assigned = false;
+    for (const wall of preferred) {
+      if (!usedSides.has(wall)) {
+        sides.push({ wall: wall as "left" | "right" | "top" | "bottom", name });
+        usedSides.add(wall);
+        assigned = true;
+        break;
+      }
+    }
+    if (!assigned) {
+      // All preferred sides taken — pick any free side
+      for (const wall of ["left", "right", "top", "bottom"]) {
+        if (!usedSides.has(wall)) {
+          sides.push({ wall: wall as "left" | "right" | "top" | "bottom", name });
+          usedSides.add(wall);
+          break;
+        }
+      }
+    }
+  }
+
+  // Compute dimensions for each side room
+  for (const { wall, name } of sides) {
+    const ratio = ratios[name] || (1 / (otherNames.length + 1));
+    const roomArea = totalArea * (ratio / totalRatio);
+    const maxDepth = wall === "left" || wall === "right"
+      ? (buildingW - liveW) / 2 - 0.1
+      : (buildingH - liveH) / 2 - 0.1;
+
+    let rw: number, rh: number, rx: number, ry: number;
+
+    if (wall === "left") {
+      rw = Math.max(2.5, Math.min(roomArea / liveH, maxDepth));
+      rh = liveH;
+      rx = liveX - rw;
+      ry = liveY;
+    } else if (wall === "right") {
+      rw = Math.max(2.5, Math.min(roomArea / liveH, maxDepth));
+      rh = liveH;
+      rx = liveX + liveW;
+      ry = liveY;
+    } else if (wall === "top") {
+      // Room ABOVE living room: room's bottom = living room's top
+      rw = liveW;
+      rh = Math.max(2.5, Math.min(roomArea / liveW, maxDepth));
+      rx = liveX;
+      ry = liveY + liveH;
+    } else {
+      // Room BELOW living room (front): room's top = living room's bottom
+      rw = liveW;
+      rh = Math.max(2.5, Math.min(roomArea / liveW, maxDepth));
+      rx = liveX;
+      ry = liveY - rh;
+    }
+
+    // Enforce balanced proportions: max 2:1 aspect ratio
+    if (rw > rh * 2) rw = rh * 2;
+    if (rh > rw * 2) rh = rw * 2;
+
+    // Ensure minimum area
+    const minArea = getMinRoomArea(name, totalArea);
+    if (rw * rh < minArea) {
+      if (wall === "left" || wall === "right") {
+        rw = Math.max(rw, minArea / rh);
+      } else {
+        rh = Math.max(rh, minArea / rw);
+      }
+    }
+
+    // Cap bathroom to a reasonable size — bathrooms don't need to span
+    // the full living room wall. Use typical bathroom proportions.
+    if (/bathroom|ensuite|wc|toilet|powder/i.test(name)) {
+      const maxBathArea = Math.min(7, totalArea * 0.08);
+      const currentArea = rw * rh;
+      if (currentArea > maxBathArea) {
+        const isVertical = wall === "left" || wall === "right";
+        // Typical bathroom: ~2m along wall × ~2.5m deep
+        if (isVertical) {
+          rh = Math.min(rh, 3.0);
+          rw = Math.max(2.0, maxBathArea / rh);
+          // Corner-align: flush with bottom of living room
+          ry = liveY;
+        } else {
+          rw = Math.min(rw, 3.0);
+          rh = Math.max(2.0, maxBathArea / rw);
+        }
+      }
+    }
+
+    rooms.push({
+      name,
+      x: parseFloat(rx.toFixed(2)),
+      y: parseFloat(ry.toFixed(2)),
+      width: parseFloat(rw.toFixed(2)),
+      height: parseFloat(rh.toFixed(2)),
+      area: parseFloat((rw * rh).toFixed(1)),
+    });
+  }
+
+  // Shift all rooms so the minimum x/y is 0
+  const minX = Math.min(...rooms.map(r => r.x));
+  const minY = Math.min(...rooms.map(r => r.y));
+  if (minX < 0) for (const r of rooms) r.x = parseFloat((r.x - minX).toFixed(2));
+  if (minY < 0) for (const r of rooms) r.y = parseFloat((r.y - minY).toFixed(2));
+}
+
+/**
+ * Trace the building outline by following actual room exterior edges.
+ * Produces L-shapes, T-shapes, etc. instead of a bounding rectangle.
+ */
+function traceBuildingOutline(rooms: GeneratedRoom[]): Array<{ x: number; y: number }> {
+  const TOL = 0.1;
+  const interior = rooms.filter(r => !/porch|balcony/i.test(r.name));
+  if (interior.length === 0) return [];
+
+  // Collect all exterior edges as segments
+  interface Edge { x1: number; y1: number; x2: number; y2: number; }
+  const edges: Edge[] = [];
+
+  for (const room of interior) {
+    const x = room.x, y = room.y, w = room.width, h = room.height;
+    const walls = [
+      { x1: x, y1: y, x2: x + w, y2: y },           // bottom
+      { x1: x + w, y1: y, x2: x + w, y2: y + h },     // right
+      { x1: x, y1: y + h, x2: x + w, y2: y + h },     // top
+      { x1: x, y1: y, x2: x, y2: y + h },             // left
+    ];
+
+    for (const edge of walls) {
+      // Check if this edge is shared with another room (segment overlap)
+      const isShared = interior.some(other => {
+        if (other === room) return false;
+        const ox = other.x, oy = other.y, ow = other.width, oh = other.height;
+        const isH = Math.abs(edge.y1 - edge.y2) < TOL;
+        if (isH) {
+          // Horizontal: same Y and X ranges overlap
+          const onBottom = Math.abs(edge.y1 - oy) < TOL;
+          const onTop = Math.abs(edge.y1 - (oy + oh)) < TOL;
+          if (!onBottom && !onTop) return false;
+          const eMin = Math.min(edge.x1, edge.x2), eMax = Math.max(edge.x1, edge.x2);
+          const oMin = ox, oMax = ox + ow;
+          return eMax > oMin + TOL && oMax > eMin + TOL;
+        } else {
+          // Vertical: same X and Y ranges overlap
+          const onLeft = Math.abs(edge.x1 - ox) < TOL;
+          const onRight = Math.abs(edge.x1 - (ox + ow)) < TOL;
+          if (!onLeft && !onRight) return false;
+          const eMin = Math.min(edge.y1, edge.y2), eMax = Math.max(edge.y1, edge.y2);
+          const oMin = oy, oMax = oy + oh;
+          return eMax > oMin + TOL && oMax > eMin + TOL;
+        }
+      });
+
+      if (!isShared) {
+        edges.push(edge);
+      }
+    }
+  }
+
+  // Chain edges into a continuous polygon
+  if (edges.length === 0) return [];
+
+  const poly: Array<{ x: number; y: number }> = [];
+  const used = new Set<number>();
+
+  // Start with the leftmost-bottommost point
+  const current = edges[0];
+  poly.push({ x: current.x1, y: current.y1 });
+  used.add(0);
+  let cx = current.x2, cy = current.y2;
+
+  while (used.size < edges.length) {
+    let found = false;
+    for (let i = 0; i < edges.length; i++) {
+      if (used.has(i)) continue;
+      const e = edges[i];
+      if (Math.abs(e.x1 - cx) < TOL && Math.abs(e.y1 - cy) < TOL) {
+        poly.push({ x: cx, y: cy });
+        cx = e.x2; cy = e.y2;
+        used.add(i);
+        found = true;
+        break;
+      }
+      if (Math.abs(e.x2 - cx) < TOL && Math.abs(e.y2 - cy) < TOL) {
+        poly.push({ x: cx, y: cy });
+        cx = e.x1; cy = e.y1;
+        used.add(i);
+        found = true;
+        break;
+      }
+    }
+    if (!found) break;
+  }
+  poly.push({ x: cx, y: cy });
+
+  return poly.length >= 3 ? poly : [];
+}
 
 /**
  * Applies creative room shapes (L-shape, bay window, angled corners)
@@ -503,7 +796,6 @@ function applyCreativeShapes(
   buildingW: number,
   buildingH: number
 ): void {
-  const TOL = 0.15;
 
   for (const room of rooms) {
     // Skip hallway, extensions, very small rooms
@@ -513,7 +805,7 @@ function applyCreativeShapes(
     const hint = shapeHints[room.name.toLowerCase()];
 
     // Determine shape based on hint or room characteristics
-    const shape = hint || inferShape(room, buildingW, buildingH);
+    const shape = hint || inferShape(room);
 
     switch (shape) {
       case "l-shape":
@@ -532,9 +824,7 @@ function applyCreativeShapes(
 
 /** Infer the best creative shape for a room based on its position */
 function inferShape(
-  room: GeneratedRoom,
-  buildingW: number,
-  buildingH: number
+  room: GeneratedRoom
 ): "rectangle" | "l-shape" | "bay-window" | "angled-corner" {
   const TOL = 0.1;
   const name = room.name.toLowerCase();
@@ -756,7 +1046,7 @@ function getMinRoomArea(name: string, totalArea?: number): number {
   if (/living|lounge|family/i.test(n)) return Math.max(14, totalArea ? totalArea * 0.12 : 14);
   if (/master/i.test(n)) return Math.max(12, totalArea ? totalArea * 0.09 : 12);
   if (/bedroom/i.test(n)) return Math.max(9, totalArea ? totalArea * 0.07 : 9);
-  if (/kitchen/i.test(n)) return Math.max(8, totalArea ? totalArea * 0.06 : 8);
+  if (/kitchen|cooking|kitchenette/i.test(n)) return Math.max(8, totalArea ? totalArea * 0.06 : 8);
   if (/dining/i.test(n)) return Math.max(8, totalArea ? totalArea * 0.06 : 8);
   if (/bathroom|ensuite/i.test(n)) return Math.max(7, totalArea ? totalArea * 0.07 : 7);
   if (/office|study/i.test(n)) return Math.max(7, totalArea ? totalArea * 0.05 : 7);
@@ -770,7 +1060,7 @@ function getMinRoomWidth(name: string): number {
   if (/garage/i.test(n)) return 3.0;
   if (/living|lounge|family/i.test(n)) return 3.0;
   if (/master|bedroom/i.test(n)) return 2.5;
-  if (/kitchen/i.test(n)) return 2.0;
+  if (/kitchen|cooking|kitchenette/i.test(n)) return 2.0;
   if (/dining/i.test(n)) return 2.2;
   if (/bathroom|ensuite/i.test(n)) return 1.5;
   return 2.0;
@@ -942,127 +1232,6 @@ function enforceZeroGapAdjacency(
       }
     }
     // If no room has headroom left, leave the excess as-is (gap above rooms is fine)
-  }
-}
-
-/**
- * Ensure the garage (if present) shares an internal wall with the kitchen.
- *
- * Runs AFTER zero-gap stacking so room positions are stable.  Strategy:
- * 1. Find garage & kitchen.  If either is missing or they already share a
- *    wall, nothing to do.
- * 2. If they're in the same column but not adjacent, re-order the column
- *    so kitchen is immediately next to the garage.
- * 3. If they're in different columns, swap kitchen with the room that is
- *    directly adjacent to the garage in the garage's column.
- * 4. After any move, re-stack the affected column(s) via the same zero-gap
- *    logic so heights stay correct.
- */
-function enforceKitchenGarageAdjacency(
-  rooms: GeneratedRoom[],
-  leftZoneX: number,
-  leftZoneWidth: number,
-  rightZoneX: number,
-  rightZoneWidth: number,
-  colStartY: number,
-  leftEndY: number,
-  rightEndY: number,
-): void {
-  const TOL = 0.15;
-  const garage = rooms.find(r => /garage/i.test(r.name));
-  const kitchen = rooms.find(r => /kitchen/i.test(r.name));
-  if (!garage || !kitchen) return;
-
-  // Already adjacent?
-  if (findWallBetween(garage, kitchen)) {
-    console.log("[kitchen-garage] already adjacent, nothing to do");
-    return;
-  }
-
-  console.log("[kitchen-garage] NOT adjacent — fixing. garage at", { x: garage.x, y: garage.y, w: garage.width, h: garage.height }, "kitchen at", { x: kitchen.x, y: kitchen.y, w: kitchen.width, h: kitchen.height });
-
-  // Determine which column each is in (after zero-gap, x is exactly colX)
-  const inLeft = (r: GeneratedRoom) => Math.abs(r.x - leftZoneX) < 0.3;
-  const inRight = (r: GeneratedRoom) => Math.abs(r.x - rightZoneX) < 0.3;
-  const garageCol = inLeft(garage) ? "left" : inRight(garage) ? "right" : null;
-  if (!garageCol) return; // shouldn't happen
-
-  const colX = garageCol === "left" ? leftZoneX : rightZoneX;
-  const colW = garageCol === "left" ? leftZoneWidth : rightZoneWidth;
-  const colEndY = garageCol === "left" ? leftEndY : rightEndY;
-
-  // All non-garage, non-kitchen, non-hallway rooms in the garage's column,
-  // sorted bottom→top.
-  const colRooms = rooms
-    .filter(r =>
-      r !== garage && r !== kitchen &&
-      !/hallway|porch|balcony|ensuite/i.test(r.name) &&
-      Math.abs(r.x - colX) < 0.3
-    )
-    .sort((a, b) => a.y - b.y);
-
-  // Find the room directly adjacent to the garage (above or below),
-  // skipping master bedrooms (swapping master would orphan its ensuite).
-  let adjacentRoom: GeneratedRoom | null = null;
-  const isSafeToSwap = (r: GeneratedRoom) => !/master/i.test(r.name);
-  for (const r of colRooms) {
-    if ((Math.abs(r.y - (garage.y + garage.height)) < TOL ||
-         Math.abs(r.y + r.height - garage.y) < TOL) && isSafeToSwap(r)) {
-      adjacentRoom = r;
-      break;
-    }
-  }
-
-  // Fallback: closest safe room in the column
-  if (!adjacentRoom) {
-    const safe = colRooms.filter(isSafeToSwap);
-    if (safe.length > 0) {
-      adjacentRoom = safe.reduce((best, r) => {
-        const dBest = Math.min(
-          Math.abs(best.y - (garage.y + garage.height)),
-          Math.abs(best.y + best.height - garage.y)
-        );
-        const dR = Math.min(
-          Math.abs(r.y - (garage.y + garage.height)),
-          Math.abs(r.y + r.height - garage.y)
-        );
-        return dR < dBest ? r : best;
-      });
-    }
-  }
-
-  if (!adjacentRoom) {
-    console.log("[kitchen-garage] ⚠️ no safe room to swap — skipping force-adjacency, will fall back to hallway door");
-    return;
-  }
-
-  // ── Swap kitchen with the adjacent room ──
-  const kX = kitchen.x, kY = kitchen.y, kW = kitchen.width, kH = kitchen.height;
-  kitchen.x = adjacentRoom.x;
-  kitchen.y = adjacentRoom.y;
-  kitchen.width = adjacentRoom.width;
-  kitchen.height = adjacentRoom.height;
-  kitchen.area = adjacentRoom.area;
-  adjacentRoom.x = kX;
-  adjacentRoom.y = kY;
-  adjacentRoom.width = kW;
-  adjacentRoom.height = kH;
-  adjacentRoom.area = parseFloat((kW * kH).toFixed(1));
-
-  // ── Re-stack BOTH columns so zero-gap holds ──
-  // Garage's column now has kitchen instead of adjacentRoom
-  enforceZeroGapAdjacency(rooms, colX, colW, colStartY, colEndY, 150);
-  // The other column (where adjacentRoom moved) also needs re-stacking
-  const otherColX = garageCol === "left" ? rightZoneX : leftZoneX;
-  const otherColW = garageCol === "left" ? rightZoneWidth : leftZoneWidth;
-  const otherEndY = garageCol === "left" ? rightEndY : leftEndY;
-  enforceZeroGapAdjacency(rooms, otherColX, otherColW, colStartY, otherEndY, 150);
-
-  // Verify adjacency was achieved
-  if (findWallBetween(garage, kitchen)) {
-    console.log("[kitchen-garage] ✅ adjacency fixed. kitchen now at", { x: kitchen.x, y: kitchen.y, w: kitchen.width, h: kitchen.height });
-  } else {
-    console.warn("[kitchen-garage] ❌ FAILED to make kitchen adjacent to garage!");
   }
 }
 
@@ -1386,69 +1555,6 @@ function carveBathroomFromStudio(
   });
 }
 
-/* ------------------------------------------------------------------ */
-/*  Building polygon generator (creative perimeters)                   */
-/* ------------------------------------------------------------------ */
-
-interface Bounds {
-  x: number; y: number; w: number; h: number;
-}
-
-/** Generate a balanced convex-ish polygon with 4-8 sides for the building footprint */
-function generateBuildingPolygon(targetArea: number): Array<{ x: number; y: number }> {
-  // Pick number of sides: more area → more sides (but capped)
-  const sides = targetArea > 200 ? pickRandom([5, 6, 6, 7]) :
-                targetArea > 120 ? pickRandom([4, 5, 5, 6]) :
-                pickRandom([4, 4, 5, 5]);
-
-  // Start with a circle of the right radius, perturb the points
-  const baseRadius = Math.sqrt(targetArea / Math.PI);
-  const points: Array<{ x: number; y: number }> = [];
-
-  for (let i = 0; i < sides; i++) {
-    const angle = (i / sides) * Math.PI * 2 - Math.PI / 2; // start from top
-    // Add controlled randomness to make it interesting but not chaotic
-    const jitter = 0.7 + Math.random() * 0.6; // 70%-130% of base radius
-    points.push({
-      x: Math.cos(angle) * baseRadius * jitter,
-      y: Math.sin(angle) * baseRadius * jitter,
-    });
-  }
-
-  // Scale to match target area exactly
-  const currentArea = polygonArea(points);
-  const scale = Math.sqrt(targetArea / currentArea);
-
-  // Center the polygon at origin, then shift to positive coords
-  let minX = Infinity, minY = Infinity;
-  const scaled = points.map(p => {
-    const sx = p.x * scale;
-    const sy = p.y * scale;
-    if (sx < minX) minX = sx;
-    if (sy < minY) minY = sy;
-    return { x: sx, y: sy };
-  });
-
-  // Shift so all coordinates are positive (origin at 0,0)
-  return scaled.map(p => ({ x: p.x - minX, y: p.y - minY }));
-}
-
-function pickRandom<T>(arr: T[]): T {
-  return arr[Math.floor(Math.random() * arr.length)];
-}
-
-/** Get bounding box of a polygon */
-function polygonBounds(poly: Array<{ x: number; y: number }>): Bounds {
-  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-  for (const p of poly) {
-    if (p.x < minX) minX = p.x;
-    if (p.y < minY) minY = p.y;
-    if (p.x > maxX) maxX = p.x;
-    if (p.y > maxY) maxY = p.y;
-  }
-  return { x: minX, y: minY, w: maxX - minX, h: maxY - minY };
-}
-
 /** Check if a point is inside a polygon (ray casting) */
 function pointInPolygon(px: number, py: number, poly: Array<{ x: number; y: number }>): boolean {
   let inside = false;
@@ -1477,67 +1583,6 @@ function rectInPolygon(
     { x: rx + rw / 2, y: ry + rh / 2 },
   ];
   return corners.every(c => pointInPolygon(c.x, c.y, poly));
-}
-
-/**
- * Clip a room to the building polygon.
- * If the room's rectangle extends outside the building, create polygon vertices
- * for the visible portion. Interior rooms stay rectangular.
- */
-function clipRoomToPolygon(
-  room: GeneratedRoom,
-  buildingPoly: Array<{ x: number; y: number }>
-): void {
-  // Quick check: is the room fully inside the polygon?
-  if (rectInPolygon(room.x, room.y, room.width, room.height, buildingPoly)) {
-    return; // fully inside, no clipping needed
-  }
-
-  // Room extends outside — generate clipped polygon
-  // Sample the room's edges and find intersection points with the building polygon
-  const clipped: Array<{ x: number; y: number }> = [];
-
-  // Start with room corners, keep those inside the building
-  const corners = [
-    { x: room.x, y: room.y },
-    { x: room.x + room.width, y: room.y },
-    { x: room.x + room.width, y: room.y + room.height },
-    { x: room.x, y: room.y + room.height },
-  ];
-
-  // Add building polygon vertices that fall inside the room
-  for (const bp of buildingPoly) {
-    if (bp.x >= room.x && bp.x <= room.x + room.width &&
-        bp.y >= room.y && bp.y <= room.y + room.height) {
-      clipped.push({ x: bp.x, y: bp.y });
-    }
-  }
-
-  // Add room corners that fall inside the building
-  for (const c of corners) {
-    if (pointInPolygon(c.x, c.y, buildingPoly)) {
-      clipped.push({ x: c.x, y: c.y });
-    }
-  }
-
-  // If we have enough points, sort them clockwise and use as polygon
-  if (clipped.length >= 3) {
-    // Sort by angle from centroid
-    const cx = clipped.reduce((s, p) => s + p.x, 0) / clipped.length;
-    const cy = clipped.reduce((s, p) => s + p.y, 0) / clipped.length;
-    clipped.sort((a, b) => Math.atan2(a.y - cy, a.x - cx) - Math.atan2(b.y - cy, b.x - cx));
-
-    room.shape = "polygon";
-    room.polygon = clipped;
-    room.area = parseFloat(polygonArea(clipped).toFixed(1));
-    // Update bounding rectangle to match polygon bounds
-    const cb = polygonBounds(clipped);
-    room.x = cb.x;
-    room.y = cb.y;
-    room.width = cb.w;
-    room.height = cb.h;
-  }
-  // If clipping produced too few vertices, keep the rectangle as-is
 }
 
 /** Create exterior extension relative to the building polygon */
@@ -1777,29 +1822,12 @@ export function isFurnitureInBounds(
   );
 }
 
-function createExtension(
-  name: string,
-  side: string,
-  rooms: GeneratedRoom[],
-  buildingW: number,
-  buildingH: number
-): GeneratedRoom | null {
-  const extW = 1.5;
-  const extH = buildingH * 0.15;
-
-  switch (side) {
-    case "front": return { name, x: (buildingW - 4) / 2, y: -1.5, width: 4, height: 1.5, area: 6 };
-    case "back":  return { name, x: buildingW * 0.3, y: buildingH, width: buildingW * 0.4, height: 1.5, area: buildingW * 0.4 * 1.5 };
-    case "left":  return { name, x: -1.5, y: buildingH * 0.4, width: 1.5, height: 2, area: 3 };
-    case "right": return { name, x: buildingW, y: buildingH * 0.4, width: 1.5, height: 2, area: 3 };
-    default: return null;
-  }
-}
-
 function generateDoors(rooms: GeneratedRoom[], skipWalls?: Set<string>, kitchenLivingConnection?: "open" | "door" | "window" | "separated"): Door[] {
   const doors: Door[] = [];
   const hallway = rooms.find(r => /hallway/i.test(r.name));
-  const kitchen = rooms.find(r => /kitchen/i.test(r.name));
+  // Kitchen as a separate room (only in larger homes with hallways).
+  // In hub-and-spoke / skipHallway layouts, kitchens are merged into living room.
+  const kitchen = rooms.find(r => /kitchen|cooking|kitchenette/i.test(r.name));
 
   for (const room of rooms) {
     if (/hallway|porch|balcony/i.test(room.name)) continue;
@@ -1936,9 +1964,43 @@ function generateDoors(rooms: GeneratedRoom[], skipWalls?: Set<string>, kitchenL
     }
   }
 
+  // ── Hub-and-spoke: internal doors from living room to every adjacent room ──
+  // In hub layouts, the living room is the central circulation space.
+  // Every other room gets a door connecting directly to the living room.
+  const hasLiving = rooms.some(r => /living|lounge|family/i.test(r.name));
+  if (!hallway && hasLiving) {
+    const living = rooms.find(r => /living|lounge|family/i.test(r.name))!;
+    for (const room of rooms) {
+      if (room === living) continue;
+      if (/porch|balcony|garage/i.test(room.name)) continue;
+
+      const sharedWall = findWallToHallway(room, living);
+      if (sharedWall) {
+        const isKitchen = /kitchen|cooking|kitchenette/i.test(room.name);
+        // Kitchen gets a wide open passage, other rooms get standard doors
+        const doorW = isKitchen ? Math.min((sharedWall === "left" || sharedWall === "right" ? room.height : room.width) * 0.6, 2.5) : 0.85;
+
+        const wallLen = sharedWall === "left" || sharedWall === "right" ? room.height : room.width;
+        // Offset: bathrooms centered (50%) so both corners stay free
+        // for shower and sink. Bedrooms and kitchens also at 50%.
+        const doorOffset = Math.max(0.5, wallLen * 0.5);
+
+        doors.push({
+          room: room.name,
+          wall: sharedWall,
+          offset: doorOffset,
+          width: doorW,
+          swing: "in" as const,
+        });
+        console.log(`[hub-doors] ${room.name} ↔ Living Room on ${sharedWall} wall (${isKitchen ? "open passage" : "door"})`);
+      }
+    }
+  }
+
   // ── Kitchen ↔ living room connection ──
   // Default: wide open-plan passage. Can be overridden to door, window, or solid wall.
   const klConnection = kitchenLivingConnection ?? "open";
+  // Skip if already handled by hub-and-spoke above (no hallway)
   if (klConnection !== "separated" && kitchen && hallway) {
     const livingRoom = rooms.find(r => /living|lounge|family/i.test(r.name));
     if (livingRoom && livingRoom !== kitchen) {
@@ -2134,6 +2196,39 @@ function generateMainEntrance(rooms: GeneratedRoom[], isGroundFloor: boolean = t
   const hallway = rooms.find(r => /hallway/i.test(r.name));
   const doorWidth = 1.0;
 
+  // ── Hub-and-spoke / small apartment: entrance MUST go through living room ──
+  const hasLivingRoom = rooms.some(r => /living|lounge|family/i.test(r.name));
+  const isHub = !hallway && hasLivingRoom && rooms.filter(r => !/porch|balcony/i.test(r.name)).length >= 3;
+
+  if (isHub) {
+    const living = rooms.find(r => /living|lounge|family/i.test(r.name))!;
+    const TOL = 0.15;
+    const otherRooms = rooms.filter(r => r !== living && !/porch|balcony/i.test(r.name));
+    const hasNeighbor = (wall: string) =>
+      wall === "bottom" ? otherRooms.some(r => Math.abs(living.y - (r.y + r.height)) < TOL)
+      : wall === "top" ? otherRooms.some(r => Math.abs((living.y + living.height) - r.y) < TOL)
+      : wall === "left" ? otherRooms.some(r => Math.abs(living.x - (r.x + r.width)) < TOL)
+      : otherRooms.some(r => Math.abs((living.x + living.width) - r.x) < TOL);
+
+    const preferredWalls: Door["wall"][] = ["bottom", "right", "left", "top"];
+    for (const w of preferredWalls) {
+      if (!hasNeighbor(w) && isExteriorWall(living, w, rooms)) {
+        const wallLen = w === "left" || w === "right" ? living.height : living.width;
+        console.log(`[main-entrance] hub: living room on ${w} wall`);
+        return [{
+          room: living.name, wall: w,
+          offset: Math.max(0.6, wallLen * 0.5),
+          width: doorWidth, swing: "in",
+        }];
+      }
+    }
+    // Fallback: any exterior wall of living room
+    const extWall = findExteriorWall(living, rooms);
+    const wallLen = extWall === "left" || extWall === "right" ? living.height : living.width;
+    console.log(`[main-entrance] hub fallback: living room on ${extWall} wall`);
+    return [{ room: living.name, wall: extWall, offset: Math.max(0.6, wallLen * 0.5), width: doorWidth, swing: "in" }];
+  }
+
   // ── Apartment/upper-floor: exterior wall WITHOUT a balcony ──
   // E.Hallway (building corridor) and balconies serve different purposes
   // and must not occupy the same exterior side of the building.
@@ -2235,20 +2330,35 @@ function generateBalconyDoors(rooms: GeneratedRoom[]): Door[] {
   const balconies = rooms.filter(r => /balcony/i.test(r.name));
 
   for (const balcony of balconies) {
-    // Find the interior room this balcony is attached to
-    const host = rooms.find(r =>
+    // Find the interior room this balcony is attached to.
+    // Use the standard adjacency check first, then a wider-tolerance fallback
+    // (mirrors detectBalconyWall in furniturePlacer.ts).
+    let host: GeneratedRoom | undefined;
+    let wall: Door["wall"] | null = null;
+
+    // Try strict adjacency (TOL=0.1) first
+    host = rooms.find(r =>
       r !== balcony &&
       !/porch|balcony/i.test(r.name) &&
       findWallToHallway(balcony, r) !== null
     );
 
-    if (!host) {
+    if (host) {
+      wall = findWallToHallway(balcony, host);
+    } else {
+      // Fallback: wider-tolerance detection (TOL=0.5) for robustness against
+      // floating-point drift from extension offset calculations.
+      for (const r of rooms) {
+        if (r === balcony || /porch|balcony/i.test(r.name)) continue;
+        const w = findBalconySharedWall(balcony, r);
+        if (w) { host = r; wall = w; break; }
+      }
+    }
+
+    if (!host || !wall) {
       console.warn(`[balcony-door] ⚠️ no host room found for "${balcony.name}" — skipping door.`);
       continue;
     }
-
-    const wall = findWallToHallway(balcony, host);
-    if (!wall) continue;
 
     const doorWidth = 2.0; // wide sliding/French door for balcony access
 
@@ -2269,6 +2379,33 @@ function generateBalconyDoors(rooms: GeneratedRoom[]): Door[] {
   }
 
   return doors;
+}
+
+/**
+ * Wide-tolerance balcony-host wall detection (TOL=0.5).
+ * Mirrors detectBalconyWall in furniturePlacer.ts for consistency.
+ */
+function findBalconySharedWall(
+  balcony: GeneratedRoom,
+  room: GeneratedRoom
+): Door["wall"] | null {
+  const TOL = 0.5;
+  const hOverlap =
+    balcony.x + balcony.width > room.x + TOL &&
+    room.x + room.width > balcony.x + TOL;
+  const vOverlap =
+    balcony.y + balcony.height > room.y + TOL &&
+    room.y + room.height > balcony.y + TOL;
+
+  // Balcony below room → shared bottom wall of room, top wall of balcony
+  if (Math.abs(room.y - (balcony.y + balcony.height)) < TOL && hOverlap) return "top";
+  // Balcony above room → shared top wall of room, bottom wall of balcony
+  if (Math.abs(balcony.y - (room.y + room.height)) < TOL && hOverlap) return "bottom";
+  // Balcony left of room → shared left wall of room, right wall of balcony
+  if (Math.abs(room.x - (balcony.x + balcony.width)) < TOL && vOverlap) return "right";
+  // Balcony right of room → shared right wall of room, left wall of balcony
+  if (Math.abs(balcony.x - (room.x + room.width)) < TOL && vOverlap) return "left";
+  return null;
 }
 
 /**

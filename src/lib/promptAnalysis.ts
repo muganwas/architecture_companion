@@ -101,7 +101,17 @@ export function analyzePrompt(description: string): PromptAnalysis {
     defaults.push({ label: "Total area", value: "~100m² (default)" });
   }
 
-  // 4. Special features
+  // 4. Kitchen — distinguish separate room vs open zone
+  const kitchenRoomMatch = desc.match(/\bkitchen\b(?!\s*(area|ette|nook|zone|space|counter))/i);
+  const kitchenZoneMatch = desc.match(/kitchen\s*(area|ette|nook|zone|space)|cooking\s*area|cook\s*area|kitchenette/i);
+
+  if (kitchenRoomMatch) {
+    found.push("Kitchen — separate room with walls");
+  } else if (kitchenZoneMatch) {
+    found.push("Kitchen area — open zone in living room (no walls)");
+  }
+
+  // 5. Special features
   const features = [
     { keyword: /porch|veranda|terrace/, label: "Porch/Veranda/Terrace" },
     { keyword: /garage|carport|parking/, label: "Garage/Parking" },
@@ -160,6 +170,8 @@ export function analyzePrompt(description: string): PromptAnalysis {
   }
   if (foundType) summaryParts.push(foundType);
   else if (!isStudio) summaryParts.push("single-story home");
+  if (kitchenRoomMatch) summaryParts.push("separate kitchen");
+  else if (kitchenZoneMatch) summaryParts.push("open kitchen zone");
   summaryParts.push(foundStyle ? `${foundStyle} style` : "Modern style");
 
   const summary = summaryParts.join(", ");
