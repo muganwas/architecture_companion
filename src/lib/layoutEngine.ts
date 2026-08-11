@@ -424,11 +424,6 @@ export function computeLayout(plan: AbstractPlan, options?: LayoutOptions): Layo
   // Only carve if the LLM's abstract plan explicitly includes an Ensuite.
   carveEnsuiteFromMaster(rooms, hallway, zones);
 
-  // ── Post-processing: carve bathroom from studio room ──
-  // Studios are single open rooms — the bathroom should be carved from
-  // the studio room rather than floating as a separate column zone.
-  carveBathroomFromStudio(rooms, zones);
-
   // Step 4: Building polygon is decorative outline only — do NOT clip rooms.
   // Clipping destroys usable room area and creates gaps between rooms.
   // The polygon is rendered as a subtle dashed outline for visual interest.
@@ -441,18 +436,19 @@ export function computeLayout(plan: AbstractPlan, options?: LayoutOptions): Layo
     if (extRoom) rooms.push(extRoom);
   }
 
-  // Step 6: Generate all doors, then windows.
-  // All doors must be known before windows so windows can avoid overlapping any door.
+  // Step 6: Generate main entrance first, so the bathroom can avoid it.
   const isGroundFloor = options?.isGroundFloor ?? true;
-
-  // For apartments, mark the interior hallway to distinguish it from the
-  // building's shared exterior corridor / stairwell.
   if (!isGroundFloor) {
     hallway.displayLabel = "I.Hallway";
   }
   const mainEntranceDoors = generateMainEntrance(rooms, isGroundFloor);
-  // Track which room+wall combos already have a main entrance door
-  // so generateDoors doesn't create a duplicate hallway door on the same wall.
+
+  // ── Post-processing: carve bathroom from studio room ──
+  // Runs AFTER balcony + entrance are placed so it can see actual positions
+  // and avoid blocking the entrance door or balcony door.
+  carveBathroomFromStudio(rooms, zones, mainEntranceDoors);
+
+  // Step 7: Generate remaining doors (internal, balcony, emergency)
   const mainEntranceWalls = new Set(mainEntranceDoors.map(d => `${d.room}:${d.wall}`));
   const doors = generateDoors(rooms, mainEntranceWalls, options?.kitchenLivingConnection);
   for (const d of mainEntranceDoors) doors.push(d);
@@ -463,6 +459,10 @@ export function computeLayout(plan: AbstractPlan, options?: LayoutOptions): Layo
     const emergencyDoors = generateEmergencyExit(rooms);
     for (const d of emergencyDoors) doors.push(d);
   }
+
+  // ── Post-check: ensure main entrance and balcony doors don't overlap ──
+  resolveDoorConflicts(doors, rooms, mainEntranceDoors, balconyDoors);
+
   const windows = generateWindows(rooms, buildingW, buildingH, doors);
 
   // Step 7: Apply creative shapes post-processing (interior shapes only)
@@ -1258,7 +1258,8 @@ function carveEnsuiteFromMaster(
  */
 function carveBathroomFromStudio(
   rooms: GeneratedRoom[],
-  zones?: Record<string, string[]>
+  zones?: Record<string, string[]>,
+  mainEntranceDoors?: Door[]
 ): void {
   const studio = rooms.find(r => /studio/i.test(r.name));
   const bathroom = rooms.find(r => /bathroom/i.test(r.name) && !/ensuite/i.test(r.name));
@@ -1296,19 +1297,18 @@ function carveBathroomFromStudio(
     return;
   }
 
-  // Use the bathroom's original ratio to determine its size
-  const bathArea = Math.max(MIN_BATH_AREA, Math.min(bathroom.area, studio.area * 0.25));
-  const bathW = Math.max(MIN_BATH_W, Math.min(3.0, Math.sqrt(bathArea * 0.75)));
+  // Use the bathroom's original ratio, capped at 18% of studio area
+  const bathArea = Math.max(MIN_BATH_AREA, Math.min(bathroom.area, studio.area * 0.18));
+  const bathW = Math.max(MIN_BATH_W, Math.min(2.6, Math.sqrt(bathArea * 0.7)));
   const bathH = Math.max(MIN_BATH_H, bathArea / bathW);
 
-  if (bathW > studio.width - 1.0 || bathH > studio.height - 2.0) {
+  if (bathW > studio.width - 1.5 || bathH > studio.height - 2.5) {
     console.warn(`[studio-bath] ⚠️ bathroom (${bathW.toFixed(1)}×${bathH.toFixed(1)}m) too large for studio (${studio.width.toFixed(1)}×${studio.height.toFixed(1)}m).`);
     return;
   }
 
   // Place bathroom in a corner of the studio — prefer exterior walls,
   // but AVOID the main entrance wall and balcony wall.
-  // The entrance should lead into the living area, not into the bathroom.
   const ext = {
     top:    isExteriorWall(studio, "top", rooms),
     bottom: isExteriorWall(studio, "bottom", rooms),
@@ -1316,40 +1316,44 @@ function carveBathroomFromStudio(
     right:  isExteriorWall(studio, "right", rooms),
   };
 
-  // Determine which walls are "blocked" — these should not have the bathroom.
-  // Primary entrance is at the front (bottom). If bottom has a balcony, entrance
-  // shifts to the left wall (apartment entrance priority: bottom → left → right → top).
-  const blockedWalls = new Set<"bottom" | "top" | "left" | "right">();
-
-  // Detect which wall has the balcony
-  let balconyWall: "bottom" | "top" | "left" | "right" | null = null;
-  const hasBalcony = rooms.some(r => /balcony/i.test(r.name));
-  if (hasBalcony) {
-    const balconyRoom = rooms.find(r => /balcony/i.test(r.name));
-    if (balconyRoom) {
-      const TOL = 0.5;
-      // Test all 4 sides — the balcony sits outside the studio, so its inner
-      // edge touches the studio's outer edge on the shared wall.
-      if (Math.abs(balconyRoom.y - (studio.y + studio.height)) < TOL) balconyWall = "bottom";
-      else if (Math.abs(balconyRoom.y + balconyRoom.height - studio.y) < TOL) balconyWall = "top";
-      else if (Math.abs(balconyRoom.x - (studio.x + studio.width)) < TOL) balconyWall = "right";
-      else if (Math.abs(balconyRoom.x + balconyRoom.width - studio.x) < TOL) balconyWall = "left";
+  // Detect balcony walls from the actual rooms (balcony now exists in rooms array)
+  const balconySides = new Set<"bottom" | "top" | "left" | "right">();
+  {
+    const TOL = 0.2;
+    let maxX = 0, maxY = 0, minX = Infinity, minY = Infinity;
+    for (const r of rooms) {
+      if (/porch|balcony/i.test(r.name)) continue;
+      if (r.x < minX) minX = r.x;
+      if (r.y < minY) minY = r.y;
+      if (r.x + r.width > maxX) maxX = r.x + r.width;
+      if (r.y + r.height > maxY) maxY = r.y + r.height;
+    }
+    for (const r of rooms) {
+      if (!/balcony/i.test(r.name)) continue;
+      if (r.y + r.height <= minY + TOL) balconySides.add("bottom");
+      if (r.y >= maxY - TOL) balconySides.add("top");
+      if (r.x + r.width <= minX + TOL) balconySides.add("left");
+      if (r.x >= maxX - TOL) balconySides.add("right");
     }
   }
 
-  // Block the balcony wall (it's occupied)
-  if (balconyWall) blockedWalls.add(balconyWall);
-
-  // Block the primary entrance wall: bottom by default, or left if bottom has balcony
-  const entranceWall = (balconyWall === "bottom") ? "left" : "bottom";
-  blockedWalls.add(entranceWall);
-
-  // Also block the fallback entrance wall (right) if both bottom AND left are taken
-  if (balconyWall === "bottom" || balconyWall === "left") {
-    // If bottom is balcony → entrance on left → right is backup
-    // If left is balcony → entrance on bottom → right is backup
-    blockedWalls.add("right");
+  // Use the ACTUAL main entrance door wall (not predicted) since the entrance
+  // has already been generated at this point.
+  const mainDoor = mainEntranceDoors?.[0];
+  const blockedWalls = new Set<"bottom" | "top" | "left" | "right">();
+  if (mainDoor) {
+    blockedWalls.add(mainDoor.wall);
+  } else {
+    // Fallback: predict entrance (shouldn't happen since entrance is already generated)
+    const entrancePriority: Array<"bottom" | "left" | "right" | "top"> = ["bottom", "left", "right", "top"];
+    for (const wall of entrancePriority) {
+      if (balconySides.has(wall)) continue;
+      blockedWalls.add(wall);
+      break;
+    }
   }
+  // Also block balcony walls
+  for (const w of balconySides) blockedWalls.add(w);
 
   const corners: Array<{ label: string; x: number; y: number; extCount: number; blockedCount: number }> = [
     { label: "top-left",     x: studio.x,                             y: studio.y,                              extCount: (ext.top ? 1 : 0) + (ext.left ? 1 : 0),   blockedCount: (blockedWalls.has("top") ? 1 : 0) + (blockedWalls.has("left") ? 1 : 0) },
@@ -1358,14 +1362,14 @@ function carveBathroomFromStudio(
     { label: "bottom-right", x: studio.x + studio.width - bathW,      y: studio.y + studio.height - bathH,     extCount: (ext.bottom ? 1 : 0) + (ext.right ? 1 : 0), blockedCount: (blockedWalls.has("bottom") ? 1 : 0) + (blockedWalls.has("right") ? 1 : 0) },
   ];
 
-  // Sort: prefer corners with FEWER blocked walls, then by exterior wall count
+  // Sort: prefer corners with FEWER blocked walls, then more exterior walls
   corners.sort((a, b) => {
     if (a.blockedCount !== b.blockedCount) return a.blockedCount - b.blockedCount;
     return b.extCount - a.extCount;
   });
   const best = corners[0];
 
-  console.log(`[studio-bath] carving bathroom from Studio corner="${best.label}" extWalls=${best.extCount} blockedWalls=${Array.from(blockedWalls)} (${bathW.toFixed(1)}×${bathH.toFixed(1)}m, ${(bathW*bathH).toFixed(1)}m²)`);
+  console.log(`[studio-bath] carving bathroom from Studio corner="${best.label}" extWalls=${best.extCount} balconyWalls=${Array.from(balconySides)} entrance=${mainDoor?.wall ?? "?"} blocked=${Array.from(blockedWalls)} (${bathW.toFixed(1)}×${bathH.toFixed(1)}m, ${(bathW*bathH).toFixed(1)}m²)`);
 
   // Remove the old separate bathroom
   const bathIdx = rooms.indexOf(bathroom);
@@ -1633,17 +1637,36 @@ function createSmartExtension(
     extWall = findExteriorWall(hostRoom, rooms);
   }
 
-  const extLen = Math.min(hostRoom.width * 0.6, 3.0);
+  const extLen = Math.min(hostRoom.width * 0.5, 2.8);
+
+  // Offset balcony to one side to leave room for bathroom door / entrance.
+  // Detect if the studio has a bathroom zone — if so, offset away from it.
+  const hasBathZone = rooms.some(r => /bathroom/i.test(r.name) && !/ensuite/i.test(r.name));
+  let extOffset: number;
+  if (hasBathZone) {
+    // Check which side the bathroom is likely on (before carving, it's still a separate room)
+    const bathRoom = rooms.find(r => /bathroom/i.test(r.name) && !/ensuite/i.test(r.name));
+    if (bathRoom && bathRoom.x + bathRoom.width / 2 < hostRoom.x + hostRoom.width / 2) {
+      // Bathroom on left → offset balcony to right
+      extOffset = Math.max(0, hostRoom.width - extLen - 0.3);
+    } else {
+      // Bathroom likely on right → offset balcony to left
+      extOffset = 0.3;
+    }
+  } else {
+    // No bathroom zone — center the balcony
+    extOffset = (hostRoom.width - extLen) / 2;
+  }
 
   switch (extWall) {
     case "bottom":
-      return { name, x: hostRoom.x + (hostRoom.width - extLen) / 2, y: hostRoom.y - 1.5, width: extLen, height: 1.5, area: parseFloat((extLen * 1.5).toFixed(1)) };
+      return { name, x: hostRoom.x + extOffset, y: hostRoom.y - 1.5, width: extLen, height: 1.5, area: parseFloat((extLen * 1.5).toFixed(1)) };
     case "top":
-      return { name, x: hostRoom.x + (hostRoom.width - extLen) / 2, y: hostRoom.y + hostRoom.height, width: extLen, height: 1.5, area: parseFloat((extLen * 1.5).toFixed(1)) };
+      return { name, x: hostRoom.x + extOffset, y: hostRoom.y + hostRoom.height, width: extLen, height: 1.5, area: parseFloat((extLen * 1.5).toFixed(1)) };
     case "left":
-      return { name, x: hostRoom.x - 1.5, y: hostRoom.y + (hostRoom.height - 2) / 2, width: 1.5, height: 2, area: 3 };
+      return { name, x: hostRoom.x - 1.5, y: hostRoom.y + extOffset, width: 1.5, height: extLen, area: parseFloat((extLen * 1.5).toFixed(1)) };
     case "right":
-      return { name, x: hostRoom.x + hostRoom.width, y: hostRoom.y + (hostRoom.height - 2) / 2, width: 1.5, height: 2, area: 3 };
+      return { name, x: hostRoom.x + hostRoom.width, y: hostRoom.y + extOffset, width: 1.5, height: extLen, area: parseFloat((extLen * 1.5).toFixed(1)) };
     default:
       return { name, x: hostRoom.x + hostRoom.width, y: hostRoom.y + (hostRoom.height - 2) / 2, width: 1.5, height: 2, area: 3 };
   }
@@ -2246,6 +2269,52 @@ function generateBalconyDoors(rooms: GeneratedRoom[]): Door[] {
   }
 
   return doors;
+}
+
+/**
+ * Detect and resolve conflicts where a main entrance door and a balcony door
+ * occupy the same physical wall segment. Offsets the balcony door away from
+ * the main entrance so they don't overlap.
+ */
+function resolveDoorConflicts(
+  doors: Door[],
+  rooms: GeneratedRoom[],
+  mainEntranceDoors: Door[],
+  balconyDoors: Door[]
+): void {
+  for (const mainDoor of mainEntranceDoors) {
+    const mainRoom = rooms.find(r => r.name === mainDoor.room);
+    if (!mainRoom) continue;
+    const mainPos = doorWorldPos(mainDoor, mainRoom);
+
+    for (const balconyDoor of balconyDoors) {
+      const balconyRoom = rooms.find(r => r.name === balconyDoor.room);
+      if (!balconyRoom) continue;
+      const balPos = doorWorldPos(balconyDoor, balconyRoom);
+      const dist = Math.sqrt((mainPos.x - balPos.x) ** 2 + (mainPos.y - balPos.y) ** 2);
+
+      // Overlapping doors on the same wall segment
+      if (dist < 0.5 && mainDoor.wall === balconyDoor.wall) {
+        const wallLen = balconyDoor.wall === "left" || balconyDoor.wall === "right"
+          ? balconyRoom.height : balconyRoom.width;
+        balconyDoor.offset = Math.max(balconyDoor.width / 2 + 0.2, wallLen * 0.2);
+        const mainWallLen = mainDoor.wall === "left" || mainDoor.wall === "right"
+          ? mainRoom.height : mainRoom.width;
+        mainDoor.offset = Math.max(mainDoor.width / 2 + 0.2, mainWallLen * 0.8);
+        console.log(`[door-conflict] resolved — offset balcony to ${balconyDoor.offset.toFixed(1)}, entrance to ${mainDoor.offset.toFixed(1)}`);
+      }
+    }
+  }
+}
+
+/** Compute world-space position of a door's center on its room's wall. */
+function doorWorldPos(door: Door, room: GeneratedRoom): { x: number; y: number } {
+  switch (door.wall) {
+    case "bottom": return { x: room.x + door.offset, y: room.y };
+    case "top":    return { x: room.x + door.offset, y: room.y + room.height };
+    case "left":   return { x: room.x, y: room.y + door.offset };
+    case "right":  return { x: room.x + room.width, y: room.y + door.offset };
+  }
 }
 
 /**

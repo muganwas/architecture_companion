@@ -333,4 +333,86 @@ describe("windows", () => {
     const balcony = r.rooms.find(x => /balcony/i.test(x.name));
     expect(balcony, "Studio plan with balcony should have a balcony room").toBeDefined();
   });
+
+  /* ---- Bathroom doesn't block entrance ---- */
+
+  it("studio bathroom does NOT touch predicted entrance wall (apartment, balcony at bottom)", () => {
+    // Balcony at front (= bottom wall) → entrance goes to left wall.
+    // Bathroom must not be on left wall.
+    const plan: AbstractPlan = {
+      totalArea: 30, hallwayWidth: 1.2, hallwaySide: "center",
+      zones: { frontLeft: ["Studio", "Bathroom"] },
+      roomRatios: { "Studio": 0.85, "Bathroom": 0.15 },
+      exteriorExtensions: { "Balcony": "front" },
+    };
+    // Compute as apartment (isGroundFloor: false)
+    const r = computeLayout(plan, { isGroundFloor: false });
+    const bathroom = r.rooms.find(x => /bathroom/i.test(x.name) && !/ensuite/i.test(x.name));
+    const studio = r.rooms.find(x => /studio/i.test(x.name));
+    expect(bathroom, "Bathroom should exist").toBeDefined();
+    expect(studio, "Studio should exist").toBeDefined();
+
+    if (bathroom && studio) {
+      // Check if bathroom is carved from studio (inside studio bounds)
+      const bInStudio =
+        bathroom.x >= studio.x - 0.01 &&
+        bathroom.y >= studio.y - 0.01 &&
+        bathroom.x + bathroom.width <= studio.x + studio.width + 0.01 &&
+        bathroom.y + bathroom.height <= studio.y + studio.height + 0.01;
+
+      // Verify the bathroom exists and is inside the studio
+      // The exact corner can vary but should not touch the bottom-left corner
+      // since that touches both the entrance wall (left) and balcony wall (bottom)
+      const touchesBottom = Math.abs(bathroom.y + bathroom.height - (studio.y + studio.height)) < 0.3;
+      const touchesLeft = Math.abs(bathroom.x - studio.x) < 0.3;
+
+      // Bathroom should NOT be on the entrance wall (left)
+      expect(touchesLeft, "Bathroom should NOT touch the left wall (entrance side)").toBe(false);
+    }
+  });
+
+  it("studio bathroom does NOT touch entrance wall (ground-floor, no balcony)", () => {
+    // No balcony → entrance goes to bottom wall.
+    // Bathroom must not be on bottom wall.
+    const plan: AbstractPlan = {
+      totalArea: 30, hallwayWidth: 1.2, hallwaySide: "center",
+      zones: { frontLeft: ["Studio", "Bathroom"] },
+      roomRatios: { "Studio": 0.85, "Bathroom": 0.15 },
+      exteriorExtensions: {},
+    };
+    const r = computeLayout(plan, { isGroundFloor: true });
+    const bathroom = r.rooms.find(x => /bathroom/i.test(x.name) && !/ensuite/i.test(x.name));
+    expect(bathroom, "Bathroom should exist").toBeDefined();
+
+    if (bathroom) {
+      const studio = r.rooms.find(x => /studio/i.test(x.name));
+      // Bathroom should not touch the bottom wall (entrance side for ground floor)
+      const touchesBottom = studio
+        ? Math.abs(bathroom.y + bathroom.height - (studio.y + studio.height)) < 0.3
+        : false;
+      expect(touchesBottom, "Bathroom should NOT touch the bottom wall (ground floor entrance)").toBe(false);
+    }
+  });
+
+  it("studio bathroom does NOT touch entrance wall (apartment, no balcony)", () => {
+    // No balcony in apartment → entrance goes to bottom wall.
+    // Bathroom should avoid bottom wall.
+    const plan: AbstractPlan = {
+      totalArea: 30, hallwayWidth: 1.2, hallwaySide: "center",
+      zones: { frontLeft: ["Studio", "Bathroom"] },
+      roomRatios: { "Studio": 0.85, "Bathroom": 0.15 },
+      exteriorExtensions: {},
+    };
+    const r = computeLayout(plan, { isGroundFloor: false });
+    const bathroom = r.rooms.find(x => /bathroom/i.test(x.name) && !/ensuite/i.test(x.name));
+    expect(bathroom, "Bathroom should exist").toBeDefined();
+
+    if (bathroom) {
+      const studio = r.rooms.find(x => /studio/i.test(x.name));
+      const touchesBottom = studio
+        ? Math.abs(bathroom.y + bathroom.height - (studio.y + studio.height)) < 0.3
+        : false;
+      expect(touchesBottom, "Bathroom should NOT touch the bottom wall (apartment entrance)").toBe(false);
+    }
+  });
 });

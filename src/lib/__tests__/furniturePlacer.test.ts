@@ -335,7 +335,7 @@ describe("Ensuite obstacle in master bedroom", () => {
     // Master bedroom furniture should not be inside the ensuite bounds
     const masterFurniture = result.filter((pf) => pf.room === "Master Bedroom");
     for (const pf of masterFurniture) {
-      if (pf.itemId === "__ensuite_obstacle__") continue;
+      if (pf.itemId === "__ensuite_obstacle__" || pf.itemId === "__bathroom_obstacle__") continue;
       const item = getFurnitureById(pf.itemId);
       if (!item) continue;
 
@@ -994,5 +994,114 @@ describe("Bathroom fixture placement", () => {
     );
     expect(hasSingle, "Small studio (< 18m²) should get single bed").toBe(true);
     expect(hasDoubleOrQueen, "Small studio should NOT get double/queen bed").toBe(false);
+  });
+
+  /* ---- Living zone arrangement: TV → coffee table → sofa ---- */
+
+  it("TV, coffee table, and sofa share the same X axis", () => {
+    const studio = makeRoom({ name: "Studio", width: 5, height: 6, area: 30 });
+    const result = suggestFurniture([studio]);
+    const tv = result.find(pf => pf.itemId === "tv-unit" && pf.room === "Studio");
+    const sofa = result.find(pf => pf.itemId === "sofa-3-seater" && pf.room === "Studio");
+    const coffee = result.find(pf => pf.itemId === "coffee-table" && pf.room === "Studio");
+
+    if (tv && sofa && coffee) {
+      // All three must share the same X position (facing each other)
+      expect(tv.x, "TV and sofa must share same X").toBeCloseTo(sofa.x);
+      expect(coffee.x, "Coffee table must share same X as TV").toBeCloseTo(tv.x);
+    }
+  });
+
+  it("coffee table is between TV and sofa (TV < coffee < sofa for bottom wall)", () => {
+    const studio = makeRoom({ name: "Studio", width: 5, height: 6, area: 30 });
+    const result = suggestFurniture([studio]);
+    const tv = result.find(pf => pf.itemId === "tv-unit" && pf.room === "Studio");
+    const sofa = result.find(pf => pf.itemId === "sofa-3-seater" && pf.room === "Studio");
+    const coffee = result.find(pf => pf.itemId === "coffee-table" && pf.room === "Studio");
+
+    if (tv && sofa && coffee) {
+      // Coffee table must be between TV and sofa (TV at bottom, sofa above)
+      expect(coffee.y, "Coffee table must be above TV").toBeGreaterThan(tv.y);
+      expect(coffee.y, "Coffee table must be below sofa").toBeLessThan(sofa.y);
+    }
+  });
+
+  it("TV is within 0.3m of the wall", () => {
+    const studio = makeRoom({ name: "Studio", width: 5, height: 6, area: 30 });
+    const result = suggestFurniture([studio]);
+    const tv = result.find(pf => pf.itemId === "tv-unit" && pf.room === "Studio");
+    if (tv) {
+      // TV should be near the bottom wall (y=0), within 0.35m (0.1m gap + half height)
+      expect(tv.y, "TV must be close to the wall (≤ 0.35m from y=0)").toBeLessThanOrEqual(0.35);
+    }
+  });
+
+  it("rug is centered under coffee table", () => {
+    const studio = makeRoom({ name: "Studio", width: 5, height: 6, area: 30 });
+    const result = suggestFurniture([studio]);
+    const rug = result.find(pf => pf.itemId === "rug-large" && pf.room === "Studio");
+    const coffee = result.find(pf => pf.itemId === "coffee-table" && pf.room === "Studio");
+
+    if (rug && coffee) {
+      // Rug and coffee table share the same X axis
+      expect(rug.x, "Rug must share X with coffee table").toBeCloseTo(coffee.x);
+      // Rug should be near the coffee table (may be repositioned by validator)
+      const yDist = Math.abs(rug.y - coffee.y);
+      expect(yDist, "Rug must be near coffee table (≤ 1m)").toBeLessThanOrEqual(1);
+    }
+  });
+
+  it("TV → sofa distance is compact (≤ 2m)", () => {
+    const studio = makeRoom({ name: "Studio", width: 5, height: 6, area: 30 });
+    const result = suggestFurniture([studio]);
+    const tv = result.find(pf => pf.itemId === "tv-unit" && pf.room === "Studio");
+    const sofa = result.find(pf => pf.itemId === "sofa-3-seater" && pf.room === "Studio");
+
+    if (tv && sofa) {
+      const dist = Math.abs(sofa.y - tv.y);
+      expect(dist, "TV → sofa distance should be compact (≤ 2m)").toBeLessThanOrEqual(2);
+    }
+  });
+
+  it("kitchen counter is wall-placed (no floating counter)", () => {
+    const studio = makeRoom({ name: "Studio", width: 5, height: 6, area: 30 });
+    const bathroom = makeRoom({ name: "Bathroom", width: 2, height: 3, area: 6, x: 10, y: 0 });
+    const result = suggestFurniture([studio, bathroom]);
+    const counter = result.find(pf =>
+      (pf.itemId === "kitchen-counter-straight" || pf.itemId === "kitchen-counter-small") &&
+      pf.room === "Studio"
+    );
+    if (counter) {
+      const item = getFurnitureById(counter.itemId);
+      if (item) {
+        const isVertical = counter.rotation === 90 || counter.rotation === 270;
+        const iw = (isVertical ? item.height : item.width) * counter.scale;
+        const ih = (isVertical ? item.width : item.height) * counter.scale;
+
+        // Must be against a wall — within 0.3m of one room edge
+        const distToBottom = counter.y - ih / 2 - studio.y;
+        const distToTop = studio.y + studio.height - (counter.y + ih / 2);
+        const distToLeft = counter.x - iw / 2 - studio.x;
+        const distToRight = studio.x + studio.width - (counter.x + iw / 2);
+
+        const minWallDist = Math.min(distToBottom, distToTop, distToLeft, distToRight);
+        expect(minWallDist, "Kitchen counter must be against a wall (≤ 0.4m)").toBeLessThanOrEqual(0.4);
+      }
+    }
+  });
+
+  it("TV avoids balcony wall in studio", () => {
+    const studio = makeRoom({ name: "Studio", width: 5, height: 6, area: 30, x: 0, y: 0 });
+    // Balcony attached to bottom wall (y = -1.5, same x range)
+    const balcony = makeRoom({ name: "Balcony", width: 2.5, height: 1.5, area: 3.8, x: 1.25, y: -1.5 });
+    const result = suggestFurniture([studio, balcony]);
+    const tv = result.find(pf => pf.itemId === "tv-unit" && pf.room === "Studio");
+    if (tv) {
+      // TV should NOT be on the bottom wall (balcony is there)
+      // Bottom wall → tv.y would be ~0.3m (0.1 gap + half height)
+      // Top wall → tv.y would be ~5.7m (room.y + room.height - 0.1 - halfH)
+      expect(tv.y, "TV must not be on balcony wall (bottom); should be on top wall")
+        .toBeGreaterThan(3); // Must be in upper half of room
+    }
   });
 });

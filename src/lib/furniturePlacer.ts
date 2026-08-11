@@ -191,6 +191,52 @@ function smartPlace(
   return null;
 }
 
+/**
+ * Detect if a balcony room is attached to this room and return the shared wall.
+ * Returns null if no balcony is attached.
+ */
+function detectBalconyWall(room: GeneratedRoom, allRooms: GeneratedRoom[]): "bottom" | "top" | "left" | "right" | null {
+  const balcony = allRooms.find(r => /balcony/i.test(r.name));
+  if (!balcony) return null;
+
+  const TOL = 0.5; // generous tolerance for floating-point slop
+
+  // Balcony is below the room → shared bottom wall
+  if (Math.abs(room.y - (balcony.y + balcony.height)) < TOL &&
+      balcony.x + balcony.width > room.x &&
+      room.x + room.width > balcony.x) {
+    console.log(`[balcony-detect] "${room.name}" shares BOTTOM wall with "${balcony.name}" (room.y=${room.y.toFixed(2)}, balcony.top=${(balcony.y + balcony.height).toFixed(2)})`);
+    return "bottom";
+  }
+
+  // Balcony is above the room → shared top wall
+  if (Math.abs(balcony.y - (room.y + room.height)) < TOL &&
+      balcony.x + balcony.width > room.x &&
+      room.x + room.width > balcony.x) {
+    console.log(`[balcony-detect] "${room.name}" shares TOP wall with "${balcony.name}"`);
+    return "top";
+  }
+
+  // Balcony is to the left → shared left wall
+  if (Math.abs(room.x - (balcony.x + balcony.width)) < TOL &&
+      balcony.y + balcony.height > room.y &&
+      room.y + room.height > balcony.y) {
+    console.log(`[balcony-detect] "${room.name}" shares LEFT wall with "${balcony.name}"`);
+    return "left";
+  }
+
+  // Balcony is to the right → shared right wall
+  if (Math.abs(balcony.x - (room.x + room.width)) < TOL &&
+      balcony.y + balcony.height > room.y &&
+      room.y + room.height > balcony.y) {
+    console.log(`[balcony-detect] "${room.name}" shares RIGHT wall with "${balcony.name}"`);
+    return "right";
+  }
+
+  console.log(`[balcony-detect] "${room.name}" (${room.x.toFixed(2)},${room.y.toFixed(2)} ${room.width.toFixed(2)}×${room.height.toFixed(2)}) vs "${balcony.name}" (${balcony.x.toFixed(2)},${balcony.y.toFixed(2)} ${balcony.width.toFixed(2)}×${balcony.height.toFixed(2)}) → NO MATCH`);
+  return null;
+}
+
 /** Place an item against a wall — tries positions along each wall, never falls back to centroid */
 function wallPlace(
   itemId: string,
@@ -198,13 +244,14 @@ function wallPlace(
   rotation: number,
   scale: number,
   existingItems: PlacedFurniture[],
-  obstZones?: ObstructionZone[]
+  obstZones?: ObstructionZone[],
+  wallMargin?: number
 ): PlacedFurniture | null {
   const item = getFurnitureById(itemId);
   if (!item) return null;
 
   const rw = room.width, rh = room.height;
-  const margin = 0.3;
+  const margin = wallMargin ?? 0.2; // default 0.2m, override for flush-fit items
 
   // The "depth into room" is always the item's height dimension —
   // at rot=0/180 height goes into Y (top/bottom walls),
@@ -315,17 +362,32 @@ function collidesWithExisting(
 
   for (const pf of existing) {
     if (pf.room !== roomName) continue;
+    // Debug wall markers (__wall_marker__ prefix) never collide
+    if (pf.itemId.startsWith("__") && pf.itemId.includes("marker")) continue;
     // Don't collision-check against items in the same functional group
     // (kitchen items can be adjacent, bathroom items can be adjacent)
     if (sameGroup(myItemId, pf.itemId)) continue;
 
     const item = getFurnitureById(pf.itemId);
-    // Virtual obstacle blocks the entire ensuite/bathroom area — but beds can overlap it
-    // since they're placed against walls, not in the middle of the room.
+    // Virtual obstacle blocks the entire ensuite/bathroom area.
+    // Beds CAN overlap an ensuite (ensuite is attached to master bedroom),
+    // but MUST NOT overlap a standalone bathroom carved from a studio.
     if (!item && pf.itemId === "__ensuite_obstacle__") {
-      if (myItemId.startsWith("bed-")) continue; // beds ignore ensuite/bathroom obstacle
+      if (myItemId.startsWith("bed-")) continue; // beds ignore ensuite obstacle (master bedroom)
       // pf.scale stores the bathroom's half-width.
       // Typical bathroom depth ≈ halfWidth * 1.5 (bathrooms are ~1.5:1 aspect ratio)
+      const obsHalfW = (pf.scale || 0.9) + margin;
+      const obsHalfH = (pf.scale || 0.9) * 1.5 + margin;
+      if (Math.abs(x - pf.x) < halfW + obsHalfW && Math.abs(y - pf.y) < halfH + obsHalfH) {
+        return true;
+      }
+      continue;
+    }
+    // Studio bathroom obstacle — blocks free-standing furniture from entering
+    // the bathroom. Wall-mounted wardrobe against the bathroom's internal
+    // partition wall is allowed through (it sits on the studio side).
+    if (!item && pf.itemId === "__bathroom_obstacle__") {
+      if (myItemId === "wardrobe") continue; // wardrobe against bathroom wall is fine
       const obsHalfW = (pf.scale || 0.9) + margin;
       const obsHalfH = (pf.scale || 0.9) * 1.5 + margin;
       if (Math.abs(x - pf.x) < halfW + obsHalfW && Math.abs(y - pf.y) < halfH + obsHalfH) {
@@ -350,21 +412,34 @@ function collidesWithExisting(
   return false;
 }
 
-/** Items in the same functional group can be placed adjacent (no collision check between them) */
+/** Items in the same functional group can be placed adjacent (no collision check between them).
+ *  ONLY pre-grouped items that are DESIGNED to overlap/stack are allowed here:
+ *  - Kitchen: counter + stove + sink (rendered as one unit)
+ *  - Bed + rug: rug at foot of bed, bed on top
+ *  - Coffee table + rug: table centered on rug
+ *  - Dining: table + chairs (atomic set)
+ *  - Desk: desk + office chair (atomic set)
+ *  ALL other items MUST NOT overlap — they get normal collision checks.
+ */
 function sameGroup(id1: string, id2: string): boolean {
-  const kitchenItems = ["kitchen-counter", "stove", "refrigerator", "kitchen-sink"]; // island excluded — must not overlap counter
-  const livingItems = ["sofa", "coffee-table", "tv-unit", "armchair", "side-table", "rug-large"];
-  const bedItems = ["bed-", "side-table"]; // wardrobe intentionally excluded — must not overlap bed
-  const diningItems = ["dining-table", "dining-chair"]; // table + chairs form a combined set
-  const deskItems = ["desk", "office-chair"]; // desk + chair form a combined set
-  // Bathroom items NOT in sameGroup — toilet, sink, shower, and tub must
-  // respect normal collision margins to prevent door-zone and mutual overlap.
+  // Kitchen counter complex: stove and sink are built into the counter rendering
+  const kitchenSet = ["kitchen-counter", "stove", "kitchen-sink"];
+  // Bed + rug: rug at foot of bed (opposite headboard), bed sits on rug
+  const bedRugSet = ["bed-", "rug-large"];
+  // Coffee table + rug: table centered on rug
+  const coffeeRugSet = ["coffee-table", "rug-large"];
+  // Atomic dining set: table + chairs
+  const diningSet = ["dining-table", "dining-chair"];
+  // Atomic desk set: desk + chair
+  const deskSet = ["desk", "office-chair"];
+  // Side table can be near bed (flanking headboard), not overlapping
+  const bedsideSet = ["bed-", "side-table"];
 
-  const groups = [kitchenItems, livingItems, bedItems, diningItems, deskItems];
+  const groups = [kitchenSet, bedRugSet, coffeeRugSet, diningSet, deskSet, bedsideSet];
   for (const group of groups) {
     const m1 = group.some(prefix => id1.includes(prefix));
     const m2 = group.some(prefix => id2.includes(prefix));
-    if (m1 && m2) return true; // same group, allow adjacency
+    if (m1 && m2) return true;
   }
   return false;
 }
@@ -641,6 +716,56 @@ export function suggestFurniture(rooms: GeneratedRoom[], doors: Door[] = [], win
     if (/studio/i.test(name)) {
       const obstZones = obstructionZonesByRoom.get(room.name) || [];
 
+      // Detect balcony wall and add its sliding door as an obstruction zone
+      // on the studio side so furniture cannot block access to the balcony.
+      const balconyWall = detectBalconyWall(room, rooms);
+      if (balconyWall) {
+        const balcony = rooms.find(r => /balcony/i.test(r.name))!;
+        // Find the actual balcony door dimensions (2m wide sliding door)
+        const balconyDoor = doors.find(d => d.room === balcony.name);
+        const doorWidth = balconyDoor?.width ?? 2.0;
+        const doorClearance = 1.5; // 1.5m clearance required in front of sliding door
+
+        // Create obstruction zone on the studio's side of the shared wall
+        let zoneX: number, zoneY: number, zoneHalfW: number, zoneHalfH: number;
+        const balCenter = balconyDoor
+          ? (balconyDoor.wall === "left" || balconyDoor.wall === "right"
+            ? balcony.y + balconyDoor.offset
+            : balcony.x + balconyDoor.offset)
+          : (balconyWall === "left" || balconyWall === "right"
+            ? balcony.y + balcony.height / 2
+            : balcony.x + balcony.width / 2);
+
+        switch (balconyWall) {
+          case "bottom":
+            zoneX = balCenter;
+            zoneY = room.y + doorClearance / 2;
+            zoneHalfW = doorWidth / 2;
+            zoneHalfH = doorClearance / 2;
+            break;
+          case "top":
+            zoneX = balCenter;
+            zoneY = room.y + room.height - doorClearance / 2;
+            zoneHalfW = doorWidth / 2;
+            zoneHalfH = doorClearance / 2;
+            break;
+          case "left":
+            zoneX = room.x + doorClearance / 2;
+            zoneY = balCenter;
+            zoneHalfW = doorClearance / 2;
+            zoneHalfH = doorWidth / 2;
+            break;
+          case "right":
+            zoneX = room.x + room.width - doorClearance / 2;
+            zoneY = balCenter;
+            zoneHalfW = doorClearance / 2;
+            zoneHalfH = doorWidth / 2;
+            break;
+        }
+        obstZones.push({ x: zoneX!, y: zoneY!, halfW: zoneHalfW!, halfH: zoneHalfH! });
+        console.log(`[balcony-zone] added 2m sliding door obstruction (${doorClearance}m clearance) on ${balconyWall} wall of "${room.name}"`);
+      }
+
       // If bathroom is carved from the studio (bathroom is inside studio bounds),
       // block that area as an obstacle so furniture doesn't overlap the bathroom
       const bathroomRoom = rooms.find(r => /bathroom/i.test(r.name) && !/ensuite/i.test(r.name));
@@ -652,10 +777,12 @@ export function suggestFurniture(rooms: GeneratedRoom[], doors: Door[] = [], win
           bathroomRoom.x + bathroomRoom.width <= room.x + room.width + 0.01 &&
           bathroomRoom.y + bathroomRoom.height <= room.y + room.height + 0.01;
         if (bInStudio) {
-          // Store bathroom half-width in scale for accurate collision detection
+          // Store bathroom half-width in scale for accurate collision detection.
+          // Use __bathroom_obstacle__ (NOT __ensuite_obstacle__) so that beds
+          // do NOT ignore this obstacle — beds must stay out of the bathroom.
           const bathHalfW = bathroomRoom.width / 2;
           placed.push({
-            itemId: "__ensuite_obstacle__",
+            itemId: "__bathroom_obstacle__",
             room: room.name,
             x: bathroomRoom.x + bathroomRoom.width / 2,
             y: bathroomRoom.y + bathroomRoom.height / 2,
@@ -665,59 +792,165 @@ export function suggestFurniture(rooms: GeneratedRoom[], doors: Door[] = [], win
         }
       }
 
-      // Determine which walls have doors or windows
-      const hasBottomObst = obstZones.some(z => Math.abs(z.y - (room.y + z.halfH)) < 0.3);
-      const hasTopObst = obstZones.some(z => Math.abs(z.y - (room.y + room.height - z.halfH)) < 0.3);
-      const hasLeftObst = obstZones.some(z => Math.abs(z.x - (room.x + z.halfW)) < 0.3);
-      const hasRightObst = obstZones.some(z => Math.abs(z.x - (room.x + room.width - z.halfW)) < 0.3);
+      // Determine which walls have door obstructions (NOT windows — windows don't block TV).
+      // Windows always have one dimension = sillDepth/2 ≈ 0.125m (the other = window width/2).
+      // Door zones have BOTH dimensions > 0.15m (clearance + door width).
+      const doorZones = obstZones.filter(z => Math.min(z.halfW, z.halfH) > 0.15);
+      const hasBottomObst = doorZones.some(z => Math.abs(z.y - (room.y + z.halfH)) < 0.3);
+      const hasTopObst = doorZones.some(z => Math.abs(z.y - (room.y + room.height - z.halfH)) < 0.3);
+      const hasLeftObst = doorZones.some(z => Math.abs(z.x - (room.x + z.halfW)) < 0.3);
+      const hasRightObst = doorZones.some(z => Math.abs(z.x - (room.x + room.width - z.halfW)) < 0.3);
 
-      // ── TV wall selection ──
-      let tvWall: "bottom" | "top" | "left" | "right" = "bottom";
-      if (hasBottomObst && !hasTopObst) tvWall = "top";
-      else if (hasBottomObst && hasTopObst) {
-        if (!hasLeftObst) tvWall = "left";
-        else if (!hasRightObst) tvWall = "right";
+      // Debug: enumerate each obstruction zone
+      if (obstZones.length > 0) {
+        console.log(`[tv-debug] "${room.name}" has ${obstZones.length} zone(s), ${doorZones.length} door zone(s):`);
+        for (const z of obstZones) {
+          const b = Math.abs(z.y - (room.y + z.halfH)) < 0.3;
+          const t = Math.abs(z.y - (room.y + room.height - z.halfH)) < 0.3;
+          const l = Math.abs(z.x - (room.x + z.halfW)) < 0.3;
+          const r = Math.abs(z.x - (room.x + room.width - z.halfW)) < 0.3;
+          const isDoor = Math.min(z.halfW, z.halfH) > 0.15;
+          console.log(`[tv-debug]   ${isDoor ? "DOOR" : "window"} x=${z.x.toFixed(2)} y=${z.y.toFixed(2)} hw=${z.halfW.toFixed(3)} hh=${z.halfH.toFixed(3)} → bottom=${b} top=${t} left=${l} right=${r}`);
+        }
       }
 
-      // ── 1. Bed zone FIRST (reserves back wall space) ──
-      // Place bed against the back wall (top wall, opposite the TV wall).
-      // This ensures the living furniture doesn't crowd the sleeping area.
+      // TV wall selection: skip walls that have doors, windows, or balcony doors
+      const wallIsBlocked = (wall: string) => {
+        if (wall === "bottom") return hasBottomObst;
+        if (wall === "top") return hasTopObst;
+        if (wall === "left") return hasLeftObst;
+        if (wall === "right") return hasRightObst;
+        return false;
+      };
+
+      // ── TV wall selection (avoid balcony wall and door walls) ──
+      type WallName = "bottom" | "top" | "left" | "right";
+      const wallOrder: WallName[] = ["bottom", "top", "left", "right"];
+      let tvWall: WallName = "bottom";
+      for (const w of wallOrder) {
+        if (!wallIsBlocked(w)) { tvWall = w; break; }
+      }
+      console.log(`[tv-wall] "${room.name}" balcony=${balconyWall ?? "none"} chosen=${tvWall} (bottomBlocked=${wallIsBlocked("bottom")} topBlocked=${wallIsBlocked("top")} leftBlocked=${wallIsBlocked("left")} rightBlocked=${wallIsBlocked("right")})`);
+
+      // ── 1. Bed zone FIRST (reserves wall space) ──
+      // Bed placement priority: adjacent walls (same side as living zone) →
+      // opposite wall (fallback). This keeps the bed near the sofa/TV/coffee area
+      // rather than isolated on the far wall.
       const bedId = roomArea >= 18 ? "bed-double" : "bed-single";
       const bed = getFurnitureById(bedId);
-      let bedPlacedY = room.y + room.height; // default: bed at top
+      let bedPlacedY = room.y + room.height; // default: bed at top (for bottom-TV)
       if (bed) {
         let bedScale = roomArea < 14 ? 0.85 : 1.0;
         if (bed.width * bedScale > rw - 0.3) bedScale = (rw - 0.3) / bed.width;
         const bw = bed.width * bedScale;
         const bh = bed.height * bedScale;
 
-        // Bed against back (top) wall, offset to one side away from entrance
-        // For entrance on bottom/left: bed on right side. For entrance on right: bed on left side.
-        const bedOnRight = tvWall !== "right";
-        const bedX = bedOnRight ? room.x + rw - bw / 2 - 0.3 : room.x + bw / 2 + 0.3;
-        const bedY = room.y + room.height - bh / 2 - 0.15;
+        // Build a priority-ordered list of { wall, rotation, x, y } candidates.
+        // Adjacent walls first (bed on same side as living zone), opposite last.
+        interface BedCandidate { wall: string; rotation: 0 | 90 | 180 | 270; x: number; y: number; }
+        const candidates: BedCandidate[] = [];
 
-        placed.push({ itemId: bedId, room: room.name, x: bedX, y: bedY, rotation: 0, scale: bedScale });
-        bedPlacedY = bedY - bh / 2; // top of bed zone
+        // Helper: add candidate for a given wall
+        const addBedCandidate = (wall: string, rot: 0 | 90 | 180 | 270, bx: number, by: number) => {
+          // Check that bed doesn't overlap bathroom obstacle before adding
+          const isVRot = rot === 90 || rot === 270;
+          const bedHalfW = (isVRot ? bh : bw) / 2;
+          const bedHalfH = (isVRot ? bw : bh) / 2;
+          // Quick bathroom overlap check
+          if (bathroomRoom && bathroomRoom !== room) {
+            const bInStudio =
+              bathroomRoom.x >= room.x - 0.01 &&
+              bathroomRoom.y >= room.y - 0.01 &&
+              bathroomRoom.x + bathroomRoom.width <= room.x + room.width + 0.01 &&
+              bathroomRoom.y + bathroomRoom.height <= room.y + room.height + 0.01;
+            if (bInStudio) {
+              const bHalfW = bathroomRoom.width / 2 + 0.1;
+              const bHalfH = bathroomRoom.height / 2 + 0.1;
+              const bCx = bathroomRoom.x + bathroomRoom.width / 2;
+              const bCy = bathroomRoom.y + bathroomRoom.height / 2;
+              if (Math.abs(bx - bCx) < bedHalfW + bHalfW && Math.abs(by - bCy) < bedHalfH + bHalfH) {
+                return; // overlaps bathroom, skip this candidate
+              }
+            }
+          }
+          candidates.push({ wall, rotation: rot, x: bx, y: by });
+        };
 
-        // Side table next to bed
-        const stX = bedOnRight ? bedX - bw / 2 - 0.3 : bedX + bw / 2 + 0.3;
-        if (stX - 0.25 >= room.x && stX + 0.25 <= room.x + rw) {
-          placed.push({ itemId: "side-table", room: room.name, x: stX, y: room.y + room.height - 0.3, rotation: 0, scale: bedScale });
+        if (tvWall === "bottom") {
+          // TV bottom → priority: right wall, left wall (adjacent, same side), then top (opposite)
+          addBedCandidate("right", 90, room.x + room.width - bh / 2 - 0.15, room.y + room.height - bw / 2 - 0.3);
+          addBedCandidate("left", 270, room.x + bh / 2 + 0.15, room.y + room.height - bw / 2 - 0.3);
+          addBedCandidate("top", 0, room.x + rw - bw / 2 - 0.3, room.y + room.height - bh / 2 - 0.15);
+          addBedCandidate("top-left", 0, room.x + bw / 2 + 0.3, room.y + room.height - bh / 2 - 0.15);
+        } else if (tvWall === "top") {
+          // TV top → priority: right wall, left wall (adjacent), then bottom (opposite)
+          addBedCandidate("right", 90, room.x + room.width - bh / 2 - 0.15, room.y + bw / 2 + 0.3);
+          addBedCandidate("left", 270, room.x + bh / 2 + 0.15, room.y + bw / 2 + 0.3);
+          addBedCandidate("bottom", 180, room.x + rw - bw / 2 - 0.3, room.y + bh / 2 + 0.15);
+          addBedCandidate("bottom-left", 180, room.x + bw / 2 + 0.3, room.y + bh / 2 + 0.15);
+        } else if (tvWall === "left") {
+          // TV left → priority: top wall, bottom wall (adjacent), then right (opposite)
+          addBedCandidate("top", 0, room.x + room.width - bw / 2 - 0.3, room.y + room.height - bh / 2 - 0.15);
+          addBedCandidate("bottom", 180, room.x + room.width - bw / 2 - 0.3, room.y + bh / 2 + 0.15);
+          addBedCandidate("right", 90, room.x + room.width - bh / 2 - 0.15, room.y + room.height - bw / 2 - 0.3);
+        } else {
+          // TV right → priority: top wall, bottom wall (adjacent), then left (opposite)
+          addBedCandidate("top", 0, room.x + bw / 2 + 0.3, room.y + room.height - bh / 2 - 0.15);
+          addBedCandidate("bottom", 180, room.x + bw / 2 + 0.3, room.y + bh / 2 + 0.15);
+          addBedCandidate("left", 270, room.x + bh / 2 + 0.15, room.y + room.height - bw / 2 - 0.3);
+        }
+
+        // Pick the first candidate that fits within room bounds
+        let bestCandidate: BedCandidate | null = null;
+        for (const c of candidates) {
+          const isVRot = c.rotation === 90 || c.rotation === 270;
+          const cw = isVRot ? bh : bw;
+          const ch = isVRot ? bw : bh;
+          if (isFurnitureInBounds(c.x, c.y, cw, ch, room)) {
+            bestCandidate = c;
+            break;
+          }
+        }
+
+        if (bestCandidate) {
+          const { x: bedX, y: bedY, rotation: bedRotation } = bestCandidate;
+          const wall = bestCandidate.wall;
+
+          placed.push({ itemId: bedId, room: room.name, x: bedX, y: bedY, rotation: bedRotation, scale: bedScale });
+
+          // Set bedPlacedY for living zone spacing
+          if (bedRotation === 0) {
+            bedPlacedY = bedY - bh / 2; // bottom edge
+          } else if (bedRotation === 180) {
+            bedPlacedY = bedY + bh / 2; // top edge
+          } else {
+            bedPlacedY = bedY; // side-wall bed, use center Y
+          }
+
+          // Side table next to bed (only for horizontal beds on top/bottom walls)
+          if (bedRotation === 0 || bedRotation === 180) {
+            const bedOnRight = bedX > room.x + rw / 2;
+            const stX = bedOnRight ? bedX - bw / 2 - 0.3 : bedX + bw / 2 + 0.3;
+            const stY = bedRotation === 0 ? room.y + room.height - 0.3 : room.y + 0.3;
+            if (stX - 0.25 >= room.x && stX + 0.25 <= room.x + rw) {
+              placed.push({ itemId: "side-table", room: room.name, x: stX, y: stY, rotation: bedRotation, scale: bedScale });
+            }
+          }
+        } else {
+          // Absolute fallback: place against top wall
+          const bedX = room.x + rw - bw / 2 - 0.3;
+          const bedY = room.y + room.height - bh / 2 - 0.15;
+          placed.push({ itemId: bedId, room: room.name, x: bedX, y: bedY, rotation: 0, scale: bedScale });
+          bedPlacedY = bedY - bh / 2;
         }
       }
 
-      // ── Wardrobe — on a free wall away from bed and entrance ──
-      const wardResult = wallPlace("wardrobe", room, 0, 0.8, placed, obstZones);
-      if (wardResult) placed.push(wardResult);
-      else {
-        const w2 = wallPlace("wardrobe", room, 90, 0.75, placed, obstZones);
-        if (w2) placed.push(w2);
-      }
+      // ── 2. Compact living zone: TV → coffee table → sofa ──
+      // All three share the same X position (offset away from bathroom).
+      // TV: tight against bottom wall (0.1m gap), sofa faces it, coffee between them.
+      // Total TV→sofa distance ≈ 1.1m, fitting comfortably even in small studios.
 
-      // ── 2. Sofa placement (opposite TV, below the bed zone) ──
-      // Offset away from bathroom if one is carved into the studio.
-      // Compute the usable X range by avoiding the bathroom zone.
+      // Offset sofaX away from bathroom if one is carved into the studio
       let sofaX = cx; // default: center
       if (bathroomRoom && bathroomRoom !== room) {
         const bInStudio =
@@ -726,96 +959,332 @@ export function suggestFurniture(rooms: GeneratedRoom[], doors: Door[] = [], win
           bathroomRoom.x + bathroomRoom.width <= room.x + room.width + 0.01 &&
           bathroomRoom.y + bathroomRoom.height <= room.y + room.height + 0.01;
         if (bInStudio) {
-          // Offset sofa away from the bathroom wall
           const bathRight = bathroomRoom.x + bathroomRoom.width;
           const bathLeft = bathroomRoom.x;
           if (bathLeft < room.x + rw * 0.3) {
-            // Bathroom on left side — sofa goes to the right side
             sofaX = room.x + bathRight + (room.x + rw - bathRight) / 2;
           } else {
-            // Bathroom on right side — sofa goes to the left side
             sofaX = room.x + (bathLeft - room.x) / 2;
           }
         }
       }
+      const tvItem = getFurnitureById("tv-unit");
+      const tvHalfH = tvItem ? tvItem.height / 2 : 0.2;
 
-      const availableH = bedPlacedY - room.y;
-      const sofaY = room.y + availableH * 0.58;
+      let tvY: number, sofaY: number, coffeeY: number;
+      if (tvWall === "bottom") {
+        tvY = room.y + 0.1 + tvHalfH;           // 0.1m off wall (center at ~0.3m)
+        coffeeY = tvY + tvHalfH + 0.55;          // ~0.55m gap from TV top
+        sofaY = coffeeY + 0.5 + 0.5;             // ~1m from coffee (0.5 gap + 0.5 sofa halfH)
+      } else if (tvWall === "top") {
+        tvY = room.y + rh - 0.1 - tvHalfH;
+        coffeeY = tvY - tvHalfH - 0.5;
+        sofaY = coffeeY - 0.45 - 0.5;
+      } else {
+        // Side walls: use room center for TV/sofa, coffee between them
+        tvY = cy;
+        sofaY = cy;
+        coffeeY = cy;
+      }
+
+      // Ensure sofa doesn't crowd the bed zone
+      if (tvWall === "bottom" && sofaY + 0.6 > bedPlacedY) {
+        sofaY = bedPlacedY - 0.6;
+        coffeeY = (tvY + sofaY) / 2;
+      } else if (tvWall === "top" && sofaY - 0.6 < bedPlacedY) {
+        sofaY = bedPlacedY + 0.6;
+        coffeeY = (tvY + sofaY) / 2;
+      }
+
       const sofa = getFurnitureById("sofa-3-seater");
       if (sofa && rw >= sofa.width * roomScale + 0.3) {
-        if (tvWall === "bottom") {
-          // Use smartPlace so we fall back if sofa collides with bed/wardrobe
-          const sResult = smartPlace("sofa-3-seater", room, sofaX, Math.min(sofaY, bedPlacedY - 0.6), 0, roomScale, placed, obstZones, "sofa");
-          if (sResult) placed.push(sResult);
-        } else if (tvWall === "top") {
-          placed.push({ itemId: "sofa-3-seater", room: room.name, x: sofaX, y: Math.max(room.y + 0.9, room.y + rh * 0.28), rotation: 0, scale: roomScale });
+        if (tvWall === "bottom" || tvWall === "top") {
+          placed.push({ itemId: "sofa-3-seater", room: room.name, x: sofaX, y: sofaY, rotation: 0, scale: roomScale });
         } else if (tvWall === "left") {
-          placed.push({ itemId: "sofa-3-seater", room: room.name, x: room.x + rw * 0.75, y: cy, rotation: 90, scale: roomScale });
+          placed.push({ itemId: "sofa-3-seater", room: room.name, x: room.x + rw * 0.75, y: sofaY, rotation: 90, scale: roomScale });
         } else {
-          placed.push({ itemId: "sofa-3-seater", room: room.name, x: room.x + rw * 0.25, y: cy, rotation: 270, scale: roomScale });
+          placed.push({ itemId: "sofa-3-seater", room: room.name, x: room.x + rw * 0.25, y: sofaY, rotation: 270, scale: roomScale });
         }
       } else {
         const sofa2 = getFurnitureById("sofa-2-seater");
         if (sofa2) {
-          placed.push({ itemId: "sofa-2-seater", room: room.name, x: sofaX, y: Math.min(sofaY, bedPlacedY - 0.5), rotation: 0, scale: 0.9 });
+          placed.push({ itemId: "sofa-2-seater", room: room.name, x: sofaX, y: sofaY, rotation: 0, scale: 0.9 });
         }
       }
 
-      // ── 3. TV unit on the TV wall (facing the sofa) ──
-      const tvItem = getFurnitureById("tv-unit");
+      // TV unit — tight against the wall, facing sofa
       if (tvItem && (rw >= 1.5 || rh >= 1.5)) {
-        let tvX = sofaX, tvY: number, tvRot: 0 | 90 | 180 | 270;
-        if (tvWall === "bottom") {
-          tvX = cx; tvY = room.y + rh * 0.12; tvRot = 0;
-        } else if (tvWall === "top") {
-          tvX = cx; tvY = room.y + rh * 0.88; tvRot = 0;
-        } else if (tvWall === "left") {
-          tvX = room.x + rw * 0.12; tvY = cy; tvRot = 90;
-        } else {
-          tvX = room.x + rw * 0.88; tvY = cy; tvRot = 270;
-        }
-        placed.push({ itemId: "tv-unit", room: room.name, x: tvX, y: tvY, rotation: tvRot, scale: roomScale });
+        placed.push({ itemId: "tv-unit", room: room.name, x: sofaX, y: tvY, rotation: 0, scale: roomScale });
       }
 
-      // ── 4. Coffee table between sofa and TV ──
+      // Coffee table + rug — directly between sofa and TV, same center
       if (roomArea >= 14) {
-        let coffeeY: number, coffeeX: number;
-        if (tvWall === "bottom") {
-          // Sofa is at sofaY or bedPlacedY-0.6, TV at rh*0.12.
-          // Coffee goes midway between them.
-          const sY = Math.min(sofaY, bedPlacedY - 0.6);
-          coffeeY = (room.y + rh * 0.12 + sY) / 2;
-          coffeeX = cx;
-        } else if (tvWall === "top") {
-          coffeeY = room.y + rh * 0.58; coffeeX = cx;
-        } else if (tvWall === "left") {
-          coffeeX = room.x + rw * 0.45; coffeeY = cy;
-        } else {
-          coffeeX = room.x + rw * 0.55; coffeeY = cy;
+        placed.push({ itemId: "coffee-table", room: room.name, x: sofaX, y: coffeeY, rotation: 0, scale: 0.9 });
+      }
+      // Rug under coffee table — anchors the living zone visually
+      if (roomArea >= 18) {
+        placed.push({ itemId: "rug-large", room: room.name, x: sofaX, y: coffeeY, rotation: 0, scale: 0.55 });
+      }
+
+      // ── 3. Bed rug — anchored UNDER the bed (centered on bed position) ──
+      // The rug sits directly under the bed, extending beyond the foot and sides.
+      // It is never placed independently — always coupled to the bed.
+      if (roomArea >= 18) {
+        const bedForRug = placed.find(pf => pf.itemId.startsWith("bed-") && pf.room === room.name);
+        if (bedForRug) {
+          // Rug at the bed's exact center — under the bed, not floating at the foot
+          placed.push({ itemId: "rug-large", room: room.name, x: bedForRug.x, y: bedForRug.y, rotation: 0, scale: 0.55 });
         }
-        placed.push({ itemId: "coffee-table", room: room.name, x: coffeeX, y: coffeeY, rotation: 0, scale: 0.9 });
       }
 
-      // ── 5. Rug under living area ──
-      if (roomArea >= 18) {
-        const sY = tvWall === "bottom" ? Math.min(sofaY, bedPlacedY - 0.6) : room.y + rh * 0.5;
-        const rugY = tvWall === "bottom" ? (room.y + rh * 0.12 + sY) / 2 : room.y + rh * 0.5;
-        placed.push({ itemId: "rug-large", room: room.name, x: cx, y: rugY, rotation: 0, scale: 0.85 });
+      // ── 4. Wardrobe — on bathroom wall (natural divider), opposite bed ──
+      // The bathroom wall is the ideal wardrobe location: it separates
+      // functional zones and is naturally opposite the sleeping area.
+      let bedWall: string | null = null;
+      const bedForWardrobe = placed.find(pf => pf.itemId.startsWith("bed-") && pf.room === room.name);
+      if (bedForWardrobe) {
+        if (bedForWardrobe.rotation === 0) bedWall = "top";
+        else if (bedForWardrobe.rotation === 180) bedWall = "bottom";
+        else if (bedForWardrobe.rotation === 90) bedWall = "right";
+        else if (bedForWardrobe.rotation === 270) bedWall = "left";
       }
 
-      // ── 6. Kitchen zone ──
+      // Helper: get the opposite wall name
+      const getOppositeWall = (w: string): string => {
+        if (w === "top") return "bottom";
+        if (w === "bottom") return "top";
+        if (w === "left") return "right";
+        return "left";
+      };
+
+      // Detect the bathroom's INTERNAL wall — the partition wall that faces
+      // into the studio (NOT the exterior wall). This is the wall the wardrobe
+      // should go against, since it's opposite the sleeping zone.
+      let bathroomWall: string | null = null;
+      if (bathroomRoom && bathroomRoom !== room) {
+        const TOL = 0.3;
+        const bRight = bathroomRoom.x + bathroomRoom.width;
+        const bTop = bathroomRoom.y + bathroomRoom.height;
+        const rRight = room.x + room.width;
+        const rTop = room.y + room.height;
+
+        // First: is the bathroom inside the studio bounds?
+        const bInStudio =
+          bathroomRoom.x >= room.x - TOL &&
+          bathroomRoom.y >= room.y - TOL &&
+          bRight <= rRight + TOL &&
+          bTop <= rTop + TOL;
+
+        if (bInStudio) {
+          // For each bathroom wall, check if it's on the studio's exterior boundary.
+          // External walls: flush with studio perimeter → NOT the wardrobe wall.
+          // Internal walls: inset from perimeter → THESE are the partition walls.
+          const extRight  = Math.abs(bRight - rRight) < TOL;
+          const extLeft   = Math.abs(bathroomRoom.x - room.x) < TOL;
+          const extTop    = Math.abs(bTop - rTop) < TOL;
+          const extBottom = Math.abs(bathroomRoom.y - room.y) < TOL;
+
+          // Internal (partition) walls are the ones NOT on the exterior.
+          const internalWalls: string[] = [];
+          if (!extRight)  internalWalls.push("right");
+          if (!extLeft)   internalWalls.push("left");
+          if (!extTop)    internalWalls.push("top");
+          if (!extBottom) internalWalls.push("bottom");
+
+          // Pick the internal wall farthest from the bed for visual balance
+          if (internalWalls.length === 1) {
+            bathroomWall = internalWalls[0];
+          } else if (internalWalls.length > 1) {
+            // Prefer the wall opposite the bed wall
+            if (bedWall && internalWalls.includes(getOppositeWall(bedWall))) {
+              bathroomWall = getOppositeWall(bedWall);
+            } else {
+              bathroomWall = internalWalls[0];
+            }
+          }
+
+        }
+      }
+      // ═══════════════════════════════════════════════════════════════
+      //  Wardrobe — directly on the internal bathroom wall (yellow line)
+      // ═══════════════════════════════════════════════════════════════
+      // We already know the exact position of the internal bathroom wall
+      // from the yellow marker. Place the wardrobe there directly.
+      let wardResult: PlacedFurniture | null = null;
+      const wardrobeItem = getFurnitureById("wardrobe");
+
+      if (bathroomWall && wardrobeItem) {
+        // Use the SAME wall geometry as the yellow marker
+        const bRight = bathroomRoom!.x + bathroomRoom!.width;
+        const bTop = bathroomRoom!.y + bathroomRoom!.height;
+        const wardScale = 0.8;
+        const wardHalfW = (wardrobeItem.width * wardScale) / 2;
+        const wardHalfH = (wardrobeItem.height * wardScale) / 2;
+
+        let wx: number, wy: number, wRot: 0 | 90 | 180 | 270;
+
+        if (bathroomWall === "left") {
+          wx = bathroomRoom!.x - wardHalfH - 0.03;
+          wy = bathroomRoom!.y + bathroomRoom!.height / 2;
+          wRot = 90;
+        } else if (bathroomWall === "right") {
+          wx = bRight + wardHalfH + 0.03;
+          wy = bathroomRoom!.y + bathroomRoom!.height / 2;
+          wRot = 90;
+        } else if (bathroomWall === "top") {
+          wx = bathroomRoom!.x + bathroomRoom!.width / 2;
+          wy = bTop + wardHalfH + 0.03;
+          wRot = 0;
+        } else {
+          // bottom
+          wx = bathroomRoom!.x + bathroomRoom!.width / 2;
+          wy = bathroomRoom!.y - wardHalfH - 0.03;
+          wRot = 0;
+        }
+
+        // Check: in bounds and no collision (wardrobe bypasses bathroom obstacle)
+        const wRotNum = wRot as number;
+        const isVRot = wRotNum === 90 || wRotNum === 270;
+        const ww = isVRot ? wardrobeItem.height * wardScale : wardrobeItem.width * wardScale;
+        const wh = isVRot ? wardrobeItem.width * wardScale : wardrobeItem.height * wardScale;
+
+        if (isFurnitureInBounds(wx, wy, ww, wh, room) &&
+            !collidesWithExisting(wx, wy, ww, wh, room.name, placed, "wardrobe")) {
+          wardResult = { itemId: "wardrobe", room: room.name, x: wx, y: wy, rotation: wRot, scale: wardScale };
+        }
+      }
+
+      // Fallback: try wallPlace with bathroom wall priority if direct placement failed
+      if (!wardResult) {
+        const wardRotations: Array<{ rot: 0 | 90 | 180 | 270; label: string }> = [];
+
+        const addWardPriority = (rot: 0 | 90 | 180 | 270, label: string) => {
+          if (!wardRotations.some(w => w.rot === rot)) wardRotations.push({ rot, label });
+        };
+
+        if (bathroomWall === "right") addWardPriority(90, "bathroom wall (right)");
+        else if (bathroomWall === "left") addWardPriority(270, "bathroom wall (left)");
+        else if (bathroomWall === "top") addWardPriority(0, "bathroom wall (top)");
+        else if (bathroomWall === "bottom") addWardPriority(180, "bathroom wall (bottom)");
+
+        if (bedWall === "top") addWardPriority(180, "opposite bed (bottom)");
+        else if (bedWall === "bottom") addWardPriority(0, "opposite bed (top)");
+        else if (bedWall === "left") addWardPriority(90, "opposite bed (right)");
+        else if (bedWall === "right") addWardPriority(270, "opposite bed (left)");
+
+        for (const r of [0, 90, 180, 270] as const) addWardPriority(r, `fallback rot=${r}`);
+
+        for (const { rot } of wardRotations) {
+          wardResult = wallPlace("wardrobe", room, rot, 0.8, placed, obstZones, 0.05);
+          if (wardResult) break;
+        }
+        if (!wardResult) {
+          for (const scale of [0.7, 0.6, 0.5]) {
+            for (const { rot } of wardRotations) {
+              wardResult = wallPlace("wardrobe", room, rot, scale, placed, obstZones, 0.05);
+              if (wardResult) break;
+            }
+            if (wardResult) break;
+          }
+        }
+      }
+
+      if (wardResult) placed.push(wardResult);
+
+      // ═══════════════════════════════════════════════════════════════
+      //  ZONE 3: KITCHEN — counter + fridge on dedicated kitchen wall
+      // ═══════════════════════════════════════════════════════════════
+      // Determine the kitchen zone wall: the wall NOT used by TV, NOT
+      // used by bed, and NOT the bathroom wall. In a well-zoned studio
+      // this is typically the wall opposite the living zone.
       if (roomArea >= 18) {
+        // Build set of walls already claimed by other zones
+        const claimedWalls = new Set<string>();
+        if (tvWall) claimedWalls.add(tvWall);
+        if (bedWall) claimedWalls.add(bedWall);
+        if (bathroomWall) claimedWalls.add(bathroomWall);
+
+        // Kitchen wall priority: unclaimed walls first, then walls shared
+        // with bathroom (natural pairing: kitchen near plumbing)
+        type KW = { wall: string; rot: 0 | 90 | 180 | 270 };
+        const kitchenWallCandidates: KW[] = [];
+
+        // Preferred: bathroom wall (plumbing makes sense for kitchen)
+        if (bathroomWall === "right") kitchenWallCandidates.push({ wall: "right", rot: 90 });
+        else if (bathroomWall === "left") kitchenWallCandidates.push({ wall: "left", rot: 270 });
+        else if (bathroomWall === "top") kitchenWallCandidates.push({ wall: "top", rot: 0 });
+        else if (bathroomWall === "bottom") kitchenWallCandidates.push({ wall: "bottom", rot: 180 });
+
+        // Fallback: any unclaimed wall
+        const allWalls: KW[] = [
+          { wall: "right", rot: 90 },
+          { wall: "left", rot: 270 },
+          { wall: "top", rot: 0 },
+          { wall: "bottom", rot: 180 },
+        ];
+        for (const kw of allWalls) {
+          if (!kitchenWallCandidates.some(k => k.wall === kw.wall)) {
+            kitchenWallCandidates.push(kw);
+          }
+        }
+
+        // Place counter on the best available kitchen wall
         const counterId = roomArea < 24 ? "kitchen-counter-small" : "kitchen-counter-straight";
-        // Place counter on the wall opposite the bed (left side vs right)
-        const cRot = tvWall === "left" ? 90 : 270;
-        const cX = tvWall === "left" ? room.x + rw - 0.4 : room.x + 0.4;
-        const counterResult = smartPlace(counterId, room, cX, room.y + rh * 0.3, cRot, 0.85, placed, obstZones, "kitchen-counter");
+        let counterResult: PlacedFurniture | null = null;
+        for (const kw of kitchenWallCandidates) {
+          counterResult = wallPlace(counterId, room, kw.rot, 0.85, placed, obstZones);
+          if (counterResult) {
+            console.log(`[kitchen-zone] counter on ${kw.wall} wall ✅`);
+            break;
+          }
+        }
+        // If no kitchen wall works, try any wall as last resort
+        if (!counterResult) {
+          counterResult = wallPlace(counterId, room, 0, 0.85, placed, obstZones);
+          if (!counterResult) {
+            counterResult = wallPlace(counterId, room, 90, 0.85, placed, obstZones);
+          }
+        }
         if (counterResult) placed.push(counterResult);
 
-        // Refrigerator in corner near kitchen zone
-        const fX = tvWall === "left" ? room.x + rw - 0.6 : room.x + 0.6;
-        const fResult = smartPlace("refrigerator", room, fX, room.y + 0.6, 0, 0.9, placed, obstZones);
-        if (fResult) placed.push(fResult);
+        // Fridge: wall-place on the SAME wall as the counter, or an adjacent
+        // unclaimed corner. NEVER use smartPlace (it has a centroid fallback).
+        // If fridge can't fit against a wall, skip it — no floating fridges.
+        if (counterResult) {
+          // Determine the counter's wall from its rotation and position
+          const cRot = counterResult.rotation;
+          let fridgeWallRot: 0 | 90 | 180 | 270;
+          if (cRot === 0 || cRot === 180) {
+            // Counter horizontal (top/bottom wall) — fridge on same wall
+            fridgeWallRot = cRot as 0 | 180;
+          } else {
+            // Counter vertical (left/right wall) — fridge on same wall
+            fridgeWallRot = cRot as 90 | 270;
+          }
+
+          // Try wallPlace on the counter's wall
+          let fridgeResult = wallPlace("refrigerator", room, fridgeWallRot, 1.0, placed, obstZones);
+          if (!fridgeResult) {
+            // Try smaller scale on same wall
+            fridgeResult = wallPlace("refrigerator", room, fridgeWallRot, 0.85, placed, obstZones);
+          }
+          if (!fridgeResult) {
+            // Try adjacent wall (perpendicular to counter wall)
+            const adjRot = (fridgeWallRot + 90) % 360 as 0 | 90 | 180 | 270;
+            fridgeResult = wallPlace("refrigerator", room, adjRot, 0.9, placed, obstZones);
+          }
+          if (!fridgeResult) {
+            // Try opposite wall (same orientation as counter)
+            const oppRot = (fridgeWallRot + 180) % 360 as 0 | 90 | 180 | 270;
+            fridgeResult = wallPlace("refrigerator", room, oppRot, 0.85, placed, obstZones);
+          }
+
+          if (fridgeResult) {
+            placed.push(fridgeResult);
+          } else {
+            console.log(`[kitchen-zone] fridge ❌ no wall position fits — skipped (never float to center)`);
+          }
+        }
       }
 
       // ── Dining set (if large enough) ──
@@ -909,17 +1378,19 @@ export function suggestFurniture(rooms: GeneratedRoom[], doors: Door[] = [], win
       }
 
       // Coffee table — between sofa and TV
+      // Compute position at this scope so rug can be anchored to the same coordinates
+      const coffeeY = tvWall === "bottom"
+        ? room.y + rh * 0.45
+        : tvWall === "top"
+          ? room.y + rh * 0.55
+          : cy;
+      const coffeeX = tvWall === "left"
+        ? room.x + room.width * 0.45
+        : tvWall === "right"
+          ? room.x + room.width * 0.55
+          : cx;
+
       if (roomArea >= 15) {
-        const coffeeY = tvWall === "bottom"
-          ? room.y + rh * 0.45
-          : tvWall === "top"
-            ? room.y + rh * 0.55
-            : cy;
-        const coffeeX = tvWall === "left"
-          ? room.x + room.width * 0.45
-          : tvWall === "right"
-            ? room.x + room.width * 0.55
-            : cx;
         placed.push({
           itemId: "coffee-table",
           room: room.name,
@@ -986,18 +1457,13 @@ export function suggestFurniture(rooms: GeneratedRoom[], doors: Door[] = [], win
         }
       }
 
-      // Rug under coffee table for larger rooms, scale with room
+      // Rug under coffee table — anchored at coffee table position, never independent
       if (roomArea >= 22) {
-        const rugY = tvWall === "bottom"
-          ? room.y + rh * 0.48
-          : tvWall === "top"
-            ? room.y + rh * 0.52
-            : cy;
         placed.push({
           itemId: "rug-large",
           room: room.name,
-          x: cx,
-          y: rugY,
+          x: coffeeX,
+          y: coffeeY,
           rotation: 0,
           scale: roomScale,
         });
@@ -1141,14 +1607,14 @@ export function suggestFurniture(rooms: GeneratedRoom[], doors: Door[] = [], win
       let wardResult: PlacedFurniture | null = null;
       const wardRotations = [90, 270, 0, 180];
       for (const wr of wardRotations) {
-        wardResult = wallPlace("wardrobe", room, wr as 0 | 90 | 180 | 270, wardScale, placed, wardObstZones);
+        wardResult = wallPlace("wardrobe", room, wr as 0 | 90 | 180 | 270, wardScale, placed, wardObstZones, 0.05);
         if (wardResult) break;
       }
       // Try smaller scales
       if (!wardResult) {
         for (const scale of [0.75, 0.65, 0.55]) {
           for (const wr of wardRotations) {
-            wardResult = wallPlace("wardrobe", room, wr as 0 | 90 | 180 | 270, scale, placed, wardObstZones);
+            wardResult = wallPlace("wardrobe", room, wr as 0 | 90 | 180 | 270, scale, placed, wardObstZones, 0.05);
             if (wardResult) break;
           }
           if (wardResult) break;
@@ -1670,8 +2136,9 @@ export function suggestFurniture(rooms: GeneratedRoom[], doors: Door[] = [], win
     "stove-4-burner", "refrigerator", "kitchen-sink",
     "kitchen-counter-straight", "kitchen-counter-small", "kitchen-counter-corner", "kitchen-island",
     "wardrobe", "desk",
-    // Living room core: sofa + rug + TV are the highest-priority decor items
-    "sofa-3-seater", "sofa-2-seater", "tv-unit", "rug-large",
+    // Living room core: sofa + coffee table + TV (NOT rug — rugs are decorative,
+    // only placed when anchored to bed or coffee table; never force-placed)
+    "sofa-3-seater", "sofa-2-seater", "tv-unit", "coffee-table",
   ]);
 
   // Items that MUST appear — if smartPlace fails, compute fitting scale
@@ -1679,8 +2146,8 @@ export function suggestFurniture(rooms: GeneratedRoom[], doors: Door[] = [], win
     "kitchen-counter-straight", "kitchen-counter-small", "stove-4-burner",
     "toilet", "sink-bathroom", "kitchen-sink", "kitchen-island",
     "wardrobe",
-    // Living room core items always appear
-    "sofa-3-seater", "sofa-2-seater", "tv-unit", "rug-large",
+    // Living room core items always appear (NOT rug — decorative, anchored only)
+    "sofa-3-seater", "sofa-2-seater", "tv-unit", "coffee-table",
     // Bathroom essentials: shower and bathtub MUST be placed if attempted
     "shower", "bathtub",
   ]);
@@ -1688,11 +2155,17 @@ export function suggestFurniture(rooms: GeneratedRoom[], doors: Door[] = [], win
   const validated: PlacedFurniture[] = [];
 
   for (const pf of placed) {
+    // Debug markers (__ prefix) pass through validation unchanged
+    if (pf.itemId.startsWith("__")) {
+      validated.push(pf);
+      continue;
+    }
+
     const room = roomMap.get(pf.room);
     if (!room) continue;
     const item = getFurnitureById(pf.itemId);
     // Allow virtual obstacles to pass through for collision blocking
-    if (!item && pf.itemId === "__ensuite_obstacle__") {
+    if (!item && (pf.itemId === "__ensuite_obstacle__" || pf.itemId === "__bathroom_obstacle__")) {
       validated.push(pf);
       continue;
     }

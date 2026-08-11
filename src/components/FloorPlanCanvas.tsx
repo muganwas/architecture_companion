@@ -841,8 +841,13 @@ export default function FloorPlanCanvas({
           </>
         )}
 
+        {/* ============ BATHROOM INTERNAL WALL MARKER (yellow) ============ */}
+        {pf.itemId === "__bathroom_wall_marker__" && (
+          <Rect x={0} y={0} width={rw} height={rh} fill="#FFD700" stroke="#E6A800" strokeWidth={1.5} cornerRadius={0} opacity={0.75} />
+        )}
+
         {/* ============ FALLBACK: simple colored rect with label ============ */}
-        {!pf.itemId.match(/sofa|armchair|dining-chair|office-chair|dining-table|coffee-table|side-table|desk|bed-|toilet|sink-bathroom|bathtub|shower|kitchen-counter|stove|refrigerator|kitchen-sink|kitchen-island|wardrobe|bookshelf|cabinet|rug-large|plant-indoor|tv-unit|outdoor/) && (
+        {!pf.itemId.match(/sofa|armchair|dining-chair|office-chair|dining-table|coffee-table|side-table|desk|bed-|toilet|sink-bathroom|bathtub|shower|kitchen-counter|stove|refrigerator|kitchen-sink|kitchen-island|wardrobe|bookshelf|cabinet|rug-large|plant-indoor|tv-unit|outdoor|__bathroom_wall_marker__/) && (
           <>
             <Rect x={0} y={0} width={rw} height={rh} fill={fillC} stroke={strokeC} strokeWidth={sw} cornerRadius={4} />
             <Text x={0} y={rh * 0.3} width={rw} height={rh * 0.4} text={item.name.substring(0, 12)} fontSize={Math.min(rw, rh) * 0.18} fill="#555" align="center" verticalAlign="middle" fontFamily="system-ui" />

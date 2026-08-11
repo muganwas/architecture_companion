@@ -454,6 +454,21 @@ export const furnitureCatalog: FurnitureItem[] = [
     rotatable: true,
     tags: ["chair", "outdoor", "patio"],
   },
+
+  /* ======================== DEBUG MARKERS ======================== */
+  {
+    id: "__bathroom_wall_marker__",
+    name: "Bathroom Wall",
+    category: "decorative",
+    width: 2.0,   // scale = halfLen, so width*scale = full wall length
+    height: 0.06, // thin 6cm yellow line
+    suitableRooms: ["__debug__"], // never matches real rooms, passes catalog validation
+    renderer: "wall-marker",
+    fill: "#FFD700",
+    stroke: "#E6A800",
+    rotatable: false,
+    tags: ["marker", "debug"],
+  },
 ];
 
 /**
