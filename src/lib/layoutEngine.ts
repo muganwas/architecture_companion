@@ -2260,9 +2260,16 @@ function generateMainEntrance(rooms: GeneratedRoom[], isGroundFloor: boolean = t
         continue;
       }
 
-      const room = rooms.find(r =>
-        check(r) && !/hallway|porch|balcony|garage/i.test(r.name)
-      );
+      const room =
+        // Prefer the living room as the entrance host so the furniture
+        // placer can see the main door and keep the seating area clear of it.
+        rooms.find(r =>
+          check(r) && !/hallway|porch|balcony|garage/i.test(r.name) &&
+          /living|lounge|family|media/i.test(r.name)
+        ) ??
+        rooms.find(r =>
+          check(r) && !/hallway|porch|balcony|garage/i.test(r.name)
+        );
 
       if (room) {
         const wallLen = wall === "left" || wall === "right" ? room.height : room.width;

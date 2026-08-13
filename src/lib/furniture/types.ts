@@ -13,7 +13,8 @@ export type FurnitureCategory =
   | "decorative"
   | "outdoor";
 
-export type FurnitureOrientation = 0 | 90 | 180 | 270;
+/** Supported rotations — includes 45° diagonals for corner arrangements. */
+export type FurnitureOrientation = 0 | 45 | 90 | 135 | 180 | 225 | 270 | 315;
 
 export interface FurnitureItem {
   /** Unique catalog id, e.g. "sofa-3-seater" */

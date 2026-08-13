@@ -3,6 +3,7 @@
 import React, { useMemo, useState, useCallback } from "react";
 import { Stage, Layer, Group, Rect, Line, Circle, Text, Arc } from "react-konva";
 import { GeneratedRoom, Door, Window } from "@/lib/ai-client";
+import { getDoorClearanceRects } from "@/lib/furniturePlacer";
 import { PlacedFurniture, getFurnitureById } from "@/lib/furniture";
 
 /* ------------------------------------------------------------------ */
@@ -781,8 +782,8 @@ export default function FloorPlanCanvas({
           </>
         )}
 
-        {/* ============ CABINET (top-down) ============ */}
-        {pf.itemId === "cabinet" && (
+        {/* ============ CABINET / WALL CABINET (top-down) ============ */}
+        {(pf.itemId === "cabinet" || pf.itemId === "wall-cabinet") && (
           <>
             <Rect x={0} y={0} width={rw} height={rh} fill={fillC} stroke={strokeC} strokeWidth={sw} cornerRadius={3} />
             {/* Door seam only — knobs not visible from above */}
@@ -791,7 +792,7 @@ export default function FloorPlanCanvas({
         )}
 
         {/* ============ RUG (top-down) ============ */}
-        {pf.itemId === "rug-large" && (
+        {(pf.itemId === "rug-large" || pf.itemId === "rug-small") && (
           <>
             <Rect x={0} y={0} width={rw} height={rh} fill={fillC} stroke={strokeC} strokeWidth={1} cornerRadius={6} opacity={0.75} />
             {/* Border pattern */}
@@ -847,7 +848,7 @@ export default function FloorPlanCanvas({
         )}
 
         {/* ============ FALLBACK: simple colored rect with label ============ */}
-        {!pf.itemId.match(/sofa|armchair|dining-chair|office-chair|dining-table|coffee-table|side-table|desk|bed-|toilet|sink-bathroom|bathtub|shower|kitchen-counter|stove|refrigerator|kitchen-sink|kitchen-island|wardrobe|bookshelf|cabinet|rug-large|plant-indoor|tv-unit|outdoor|__bathroom_wall_marker__/) && (
+        {!pf.itemId.match(/sofa|armchair|dining-chair|office-chair|dining-table|coffee-table|side-table|desk|bed-|toilet|sink-bathroom|bathtub|shower|kitchen-counter|stove|refrigerator|kitchen-sink|kitchen-island|wardrobe|bookshelf|cabinet|wall-cabinet|rug-large|rug-small|plant-indoor|tv-unit|outdoor|__bathroom_wall_marker__/) && (
           <>
             <Rect x={0} y={0} width={rw} height={rh} fill={fillC} stroke={strokeC} strokeWidth={sw} cornerRadius={4} />
             <Text x={0} y={rh * 0.3} width={rw} height={rh * 0.4} text={item.name.substring(0, 12)} fontSize={Math.min(rw, rh) * 0.18} fill="#555" align="center" verticalAlign="middle" fontFamily="system-ui" />
@@ -991,6 +992,27 @@ export default function FloorPlanCanvas({
               />
             );
           })()}
+
+          {/* Door clearance areas — yellow dotted = swing side, blue dotted = opposite side */}
+          {getDoorClearanceRects(rooms, doors).map((rect, i) => {
+            const p0 = toCanvas(rect.x, rect.y, s, bb);
+            const p1 = toCanvas(rect.x + rect.width, rect.y + rect.height, s, bb);
+            const isSwing = rect.side === "swing";
+            return (
+              <Group key={`door-clearance-${i}`}>
+                <Rect
+                  x={Math.min(p0.x, p1.x)}
+                  y={Math.min(p0.y, p1.y)}
+                  width={Math.abs(p1.x - p0.x)}
+                  height={Math.abs(p1.y - p0.y)}
+                  fill={isSwing ? "rgba(234,179,8,0.08)" : "rgba(59,130,246,0.08)"}
+                  stroke={isSwing ? "#eab308" : "#3b82f6"}
+                  strokeWidth={1.4}
+                  dash={[6, 4]}
+                />
+              </Group>
+            );
+          })}
 
           {/* North arrow */}
           <Group x={STAGE_W - 38} y={28}>

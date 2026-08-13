@@ -558,29 +558,35 @@ describe("Bathroom fixtures", () => {
           ["toilet", "sink-bathroom", "shower", "bathtub"].includes(pf.itemId)
         );
 
-        // Compute door zone (mirrors getDoorZone in furniturePlacer.ts)
-        const clearance = 0.95; // door.width(0.8) + 0.15
+        // Compute door zone (mirrors getDoorZone in furniturePlacer.ts):
+        // the swing side (swing="in") is 0.7m into the room; the zone spans
+        // door width + 0.2m on each side along the wall (matching the
+        // yellow/blue overlay rects). The overlap test mirrors
+        // overlapsObstruction exactly: 0.05m margin and the same -1e-9
+        // epsilon, so boundary-touching placements (legal) are not flagged.
+        const clearance = 0.7;
+        const margin = 0.05;
         let dzX: number, dzY: number, dzHalfW: number, dzHalfH: number;
         switch (wall) {
           case "bottom":
             dzX = bath.x + doorOffset;
             dzY = bath.y + clearance / 2;
-            dzHalfW = 0.4; dzHalfH = clearance / 2;
+            dzHalfW = door.width / 2 + 0.2; dzHalfH = clearance / 2;
             break;
           case "top":
             dzX = bath.x + doorOffset;
             dzY = bath.y + bath.height - clearance / 2;
-            dzHalfW = 0.4; dzHalfH = clearance / 2;
+            dzHalfW = door.width / 2 + 0.2; dzHalfH = clearance / 2;
             break;
           case "left":
             dzX = bath.x + clearance / 2;
             dzY = bath.y + doorOffset;
-            dzHalfW = clearance / 2; dzHalfH = 0.4;
+            dzHalfW = clearance / 2; dzHalfH = door.width / 2 + 0.2;
             break;
           default: // right
             dzX = bath.x + bath.width - clearance / 2;
             dzY = bath.y + doorOffset;
-            dzHalfW = clearance / 2; dzHalfH = 0.4;
+            dzHalfW = clearance / 2; dzHalfH = door.width / 2 + 0.2;
             break;
         }
 
@@ -591,8 +597,8 @@ describe("Bathroom fixtures", () => {
           const pfH = (isRot ? item.width : item.height) * pf.scale;
 
           const overlapsDoor =
-            Math.abs(pf.x - dzX) < pfW / 2 + dzHalfW + 0.02 &&
-            Math.abs(pf.y - dzY) < pfH / 2 + dzHalfH + 0.02;
+            Math.abs(pf.x - dzX) - (pfW / 2 + dzHalfW + margin) < -1e-9 &&
+            Math.abs(pf.y - dzY) - (pfH / 2 + dzHalfH + margin) < -1e-9;
 
           expect(overlapsDoor,
             `${pf.itemId} in ${cfg.w}×${cfg.h}m bathroom (door on ${wall}) overlaps door zone`
@@ -903,20 +909,19 @@ describe("Bathroom fixture placement", () => {
     }
   });
 
-  it("bathtub is only placed when room is long enough for its full length", () => {
-    // Room too narrow for bathtub (1.7m length at 0.9 scale = 1.53m needed)
-    // Room is 1.5m wide and 1.5m tall — neither dimension fits the bathtub
+  it("bathtub requires area ≥ 6m² — smaller rooms get a shower instead", () => {
+    // Bathtub rule in furniturePlacer.ts:
+    //   canFitBathtub = longestSide >= 1.83m (1.53m tub + 0.3m clearance) && area >= 6m²
+    // Below 6m² the layout falls back to a shower.
     const tiny = makeRoom({ name: "Bathroom", width: 1.5, height: 1.5, area: 2.25 });
     const tinyResult = suggestFurniture([tiny]);
+    // Too small for a bathtub — gets a shower instead
     expect(tinyResult.find((pf) => pf.itemId === "bathtub")).toBeUndefined();
+    expect(tinyResult.some((pf) => pf.itemId === "shower")).toBe(true);
 
-    // Room with 2m dimension should fit bathtub (1.53m needed, 2m available)
-    const fits = makeRoom({ name: "Bathroom", width: 1.8, height: 2.2, area: 3.96 });
-    // area < 6, so should get shower not bathtub
-    // area >= 6 is needed
+    // Area ≥ 6m² (longest side 3.2m ≥ 1.83m) → bathtub is placed
     const enough = makeRoom({ name: "Bathroom", width: 2, height: 3.2, area: 6.4 });
     const enoughResult = suggestFurniture([enough]);
-    // Long dimension 3.2m, area ≥ 6 → bathtub should be placed
     expect(enoughResult.find((pf) => pf.itemId === "bathtub")).toBeDefined();
   });
 

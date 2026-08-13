@@ -374,7 +374,7 @@ export const furnitureCatalog: FurnitureItem[] = [
   },
   {
     id: "cabinet",
-    name: "Storage Cabinet",
+    name: "Base Cabinet (Low)",
     category: "storage",
     width: 0.9,
     height: 0.45,
@@ -383,7 +383,22 @@ export const furnitureCatalog: FurnitureItem[] = [
     fill: "#C4A882",
     stroke: "#8B7355",
     rotatable: true,
-    tags: ["cabinet", "storage"],
+    // Low/base cabinet — sits under the window sill, allowed near windows.
+    tags: ["cabinet", "storage", "low"],
+  },
+  {
+    id: "wall-cabinet",
+    name: "Wall Cabinet (Upper)",
+    category: "storage",
+    width: 1.2,
+    height: 0.4,
+    suitableRooms: ["kitchen", "kitchenette", "living room", "family room", "laundry"],
+    renderer: "wall-cabinet",
+    fill: "#D9C9B4",
+    stroke: "#A89880",
+    rotatable: true,
+    // Upper/wall-mounted cabinet — TALL, strictly forbidden in front of windows.
+    tags: ["cabinet", "storage", "wall", "upper"],
   },
 
   /* ======================== DECORATIVE ======================== */
@@ -399,6 +414,19 @@ export const furnitureCatalog: FurnitureItem[] = [
     stroke: "#B8955A",
     rotatable: true,
     tags: ["rug", "carpet", "decorative"],
+  },
+  {
+    id: "rug-small",
+    name: "Small Rug",
+    category: "decorative",
+    width: 1.2,
+    height: 0.9,
+    suitableRooms: ["living room", "family room", "bedroom"],
+    renderer: "rug",
+    fill: "#D4A76A",
+    stroke: "#B8955A",
+    rotatable: true,
+    tags: ["rug", "carpet", "small"],
   },
   {
     id: "plant-indoor",
@@ -489,6 +517,13 @@ export function getFurnitureForRoom(roomName: string): FurnitureItem[] {
     const studioRooms = ["living room", "bedroom", "kitchen", "dining", "master bedroom"];
     return furnitureCatalog.filter((item) =>
       item.suitableRooms.some((r) => studioRooms.some(s => r.includes(s)))
+    );
+  }
+
+  // Cooking areas are STRICTLY for kitchen appliances.
+  if (/cooking/i.test(lower)) {
+    return furnitureCatalog.filter((item) =>
+      item.category === "kitchen" || item.category === "appliance"
     );
   }
 

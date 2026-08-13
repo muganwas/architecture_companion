@@ -472,6 +472,23 @@ const renderers: Record<string, (ctx: RenderContext) => React.ReactElement> = {
     );
   },
 
+  /* ---------- WALL CABINET (UPPER, MOUNTED) ---------- */
+  "wall-cabinet": ({ item, w, h }) => {
+    const fill = item.fill;
+    const stroke = item.stroke;
+    return (
+      <Group>
+        <Rect x={0} y={0} width={w} height={h} fill={fill} stroke={stroke} strokeWidth={0.02} cornerRadius={0.03} />
+        {/* Doors */}
+        <Rect x={w * 0.05} y={h * 0.08} width={w * 0.42} height={h * 0.84} fill={fill} stroke={stroke} strokeWidth={0.01} cornerRadius={0.02} opacity={0.7} />
+        <Rect x={w * 0.53} y={h * 0.08} width={w * 0.42} height={h * 0.84} fill={fill} stroke={stroke} strokeWidth={0.01} cornerRadius={0.02} opacity={0.7} />
+        {/* Knobs */}
+        <Circle x={w * 0.42} y={h * 0.5} radius={0.02} fill={stroke} />
+        <Circle x={w * 0.58} y={h * 0.5} radius={0.02} fill={stroke} />
+      </Group>
+    );
+  },
+
   /* ---------- RUG ---------- */
   "rug": ({ item, w, h }) => {
     const fill = item.fill;
