@@ -14,10 +14,16 @@
 /*     smaller       → bed : living         = 1 : 2                    */
 /*     too small     → the whole space is the sleeping (bed) area      */
 /*                                                                     */
-/*  Zones are cut as one CONTIGUOUS space each: thin continuation      */
-/*  pieces are reshaped into full-width horizontal bands so a zone is  */
-/*  a single region (a few odd corners are fine), and each zone is     */
-/*  rendered as ONE merged outline with one label.                     */
+/*  Zones are plain RECTANGLES — each zone is a single rectangle (rooms   */
+/*  with invisible walls, no L-shapes or split pieces). One zone may get  */
+/*  a slightly different area when a carved bathroom forces the free     */
+/*  space into multiple pieces; the ratios stay exact whenever a single  */
+/*  piece hosts all the zones.                                           */
+/*                                                                     */
+/*  Studio door rules (applied when doors are known):                  */
+/*    the living zone must sit at the main entrance (kitchen stays    */
+/*    north), and the bed zone must be closest to the carved          */
+/*    bathroom's door.                                                */
 /* ------------------------------------------------------------------ */
 
 import { GeneratedRoom, Door, Window } from "./ai-client";
@@ -85,16 +91,31 @@ function distToRects(p: { x: number; y: number }, rects: Rect[]): number {
   return best === Infinity ? 0 : best;
 }
 
-function isBedId(id: string): boolean {
+export function isBedItemId(id: string): boolean {
   return id.startsWith("bed-");
 }
 
-function isKitchenId(id: string): boolean {
+export function isKitchenItemId(id: string): boolean {
   return /kitchen-counter|kitchen-island|refrigerator|stove|kitchen-sink|wall-cabinet/.test(id);
 }
 
-function isLivingId(id: string): boolean {
+export function isLivingItemId(id: string): boolean {
   return /sofa-|coffee-table|tv-unit|armchair|side-table|rug-/.test(id);
+}
+
+/**
+ * True when an axis-aligned box (x, y = bottom-left corner, w/h = size)
+ * lies FULLY inside the zone's rectangles (the union of the rects).
+ * Used by the furniture placer to enforce zone separation.
+ */
+export function boxInsideZone(
+  x: number, y: number, w: number, h: number,
+  rects: ZoneRect[]
+): boolean {
+  if (rects.length === 0) return false;
+  // Subtract the zone rects from the box — nothing may remain uncovered.
+  const holes: Rect[] = rects.map(r => ({ x: r.x, y: r.y, w: r.width, h: r.height }));
+  return subtractHoles({ x, y, w, h }, holes).length === 0;
 }
 
 /** Axis-aligned rectangles of `room` minus the holes (carved ensuite/bathroom). */
@@ -125,35 +146,75 @@ function subtractHoles(room: Rect, holes: Rect[]): Rect[] {
 /**
  * Carve the free pieces into kindless slots whose areas follow the weights,
  * in a deterministic spatial order (splits along the longer axis).
+ *
+ * When a slot continues into a NEW piece, the band is carved from the side
+ * of that piece that borders the slot's existing rects — so a zone always
+ * stays ONE contiguous space (zones behave like rooms with invisible walls).
  */
 function carveSlots(pieces: Rect[], weights: number[]): Slot[] {
   const totalW = weights.reduce((s, w) => s + w, 0);
   const totalA = pieces.reduce((s, p) => s + rectArea(p), 0);
   const avail: Array<{ rect: Rect; piece: number }> = pieces.map((p, i) => ({ rect: { ...p }, piece: i }));
   const slots: Slot[] = [];
+  const EPS = 1e-6;
 
   for (const w of weights) {
     let target = (w / totalW) * totalA;
     const rects: SlotRect[] = [];
-    while (target > 1e-6 && avail.length > 0) {
+    while (target > EPS && avail.length > 0) {
       const p = avail[0].rect;
       const pieceIdx = avail[0].piece;
       const pa = rectArea(p);
-      if (pa <= target + 1e-6) {
+      if (pa <= target + EPS) {
         rects.push({ ...p, piece: pieceIdx });
         avail.shift();
         target -= pa;
         continue;
       }
-      const splitX = p.w >= p.h;
-      if (splitX) {
-        const w1 = target / p.h;
-        rects.push({ x: p.x, y: p.y, w: w1, h: p.h, piece: pieceIdx });
-        avail[0] = { rect: { x: p.x + w1, y: p.y, w: p.w - w1, h: p.h }, piece: pieceIdx };
-      } else {
+
+      // Does this slot already own rects? Carve the new band from the side
+      // of THIS piece that borders them (bottom/top/left/right), so the
+      // continuation stays attached to the zone's existing space.
+      let side: "bottom" | "top" | "left" | "right" | null = null;
+      if (rects.length > 0) {
+        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+        for (const r of rects) {
+          minX = Math.min(minX, r.x); minY = Math.min(minY, r.y);
+          maxX = Math.max(maxX, r.x + r.w); maxY = Math.max(maxY, r.y + r.h);
+        }
+        if (maxY <= p.y + EPS) side = "bottom";
+        else if (minY >= p.y + p.h - EPS) side = "top";
+        else if (maxX <= p.x + EPS) side = "left";
+        else if (minX >= p.x + p.w - EPS) side = "right";
+      }
+
+      if (side === "bottom") {
         const h1 = target / p.w;
         rects.push({ x: p.x, y: p.y, w: p.w, h: h1, piece: pieceIdx });
         avail[0] = { rect: { x: p.x, y: p.y + h1, w: p.w, h: p.h - h1 }, piece: pieceIdx };
+      } else if (side === "top") {
+        const h1 = target / p.w;
+        rects.push({ x: p.x, y: p.y + p.h - h1, w: p.w, h: h1, piece: pieceIdx });
+        avail[0] = { rect: { x: p.x, y: p.y, w: p.w, h: p.h - h1 }, piece: pieceIdx };
+      } else if (side === "left") {
+        const w1 = target / p.h;
+        rects.push({ x: p.x, y: p.y, w: w1, h: p.h, piece: pieceIdx });
+        avail[0] = { rect: { x: p.x + w1, y: p.y, w: p.w - w1, h: p.h }, piece: pieceIdx };
+      } else if (side === "right") {
+        const w1 = target / p.h;
+        rects.push({ x: p.x + p.w - w1, y: p.y, w: w1, h: p.h, piece: pieceIdx });
+        avail[0] = { rect: { x: p.x, y: p.y, w: p.w - w1, h: p.h }, piece: pieceIdx };
+      } else {
+        const splitX = p.w >= p.h;
+        if (splitX) {
+          const w1 = target / p.h;
+          rects.push({ x: p.x, y: p.y, w: w1, h: p.h, piece: pieceIdx });
+          avail[0] = { rect: { x: p.x + w1, y: p.y, w: p.w - w1, h: p.h }, piece: pieceIdx };
+        } else {
+          const h1 = target / p.w;
+          rects.push({ x: p.x, y: p.y, w: p.w, h: h1, piece: pieceIdx });
+          avail[0] = { rect: { x: p.x, y: p.y + h1, w: p.w, h: p.h - h1 }, piece: pieceIdx };
+        }
       }
       target = 0;
     }
@@ -473,6 +534,161 @@ function groupCentroid(items: PlacedFurniture[], fallback: { x: number; y: numbe
   return { x: cx, y: cy };
 }
 
+/** World position of a door on its room's wall (on the boundary line). */
+function doorWorldPoint(door: Door, room: GeneratedRoom | undefined): { x: number; y: number } | null {
+  if (!door || !room) return null;
+  switch (door.wall) {
+    case "bottom": return { x: room.x + door.offset, y: room.y };
+    case "top": return { x: room.x + door.offset, y: room.y + room.height };
+    case "left": return { x: room.x, y: room.y + door.offset };
+    case "right": return { x: room.x + room.width, y: room.y + door.offset };
+  }
+}
+
+/** Squared distance from a point to the nearest rectangle of a zone. */
+function pointToZoneDist(p: { x: number; y: number }, z: RoomZone): number {
+  let best = Infinity;
+  for (const r of z.rects) {
+    const cx = Math.max(r.x, Math.min(p.x, r.x + r.width));
+    const cy = Math.max(r.y, Math.min(p.y, r.y + r.height));
+    best = Math.min(best, (p.x - cx) ** 2 + (p.y - cy) ** 2);
+  }
+  return best === Infinity ? 0 : best;
+}
+
+/** All ways to split a sequence of `k` items into `p` consecutive non-empty groups. */
+function compositions(k: number, p: number): number[][] {
+  if (p > k || p < 1 || k < 1) return [];
+  if (p === 1) return [[k]];
+  const out: number[][] = [];
+  for (let first = 1; first <= k - (p - 1); first++) {
+    for (const rest of compositions(k - first, p - 1)) {
+      out.push([first, ...rest]);
+    }
+  }
+  return out;
+}
+
+/**
+ * Carve the pieces into bands along each piece's longer axis so EVERY zone
+ * is a SINGLE rectangle (zones are plain rooms with invisible walls — no
+ * L-shapes, no split pieces). `groupSizes[p]` says how many kinds piece `p`
+ * hosts; kinds are assigned in `kindOrder` sequence.
+ */
+function buildRectZones(
+  roomName: string,
+  pieces: Rect[],
+  kinds: Array<{ kind: ZoneKind; weight: number }>,
+  pieceOrder: number[],
+  kindOrder: number[],
+  groupSizes: number[]
+): RoomZone[] {
+  const zones: RoomZone[] = [];
+  let ki = 0;
+  for (let p = 0; p < pieceOrder.length; p++) {
+    const piece = pieces[pieceOrder[p]];
+    const group = kindOrder.slice(ki, ki + groupSizes[p]);
+    ki += groupSizes[p];
+    const totalW = group.reduce((s, gi) => s + kinds[gi].weight, 0) || 1;
+    const horizontal = piece.w >= piece.h;
+    const longer = horizontal ? piece.w : piece.h;
+    const shorter = horizontal ? piece.h : piece.w;
+    let cursor = 0;
+    for (let i = 0; i < group.length; i++) {
+      const gi = group[i];
+      const frac = kinds[gi].weight / totalW;
+      const len = i === group.length - 1 ? longer - cursor : frac * longer;
+      const rect: ZoneRect = horizontal
+        ? { x: piece.x + cursor, y: piece.y, width: len, height: shorter }
+        : { x: piece.x, y: piece.y + cursor, width: shorter, height: len };
+      cursor += len;
+      const kind = kinds[gi].kind;
+      zones.push({
+        room: roomName, kind, rects: [rect],
+        x: rect.x, y: rect.y, width: rect.width, height: rect.height,
+      });
+    }
+  }
+  return zones;
+}
+
+/**
+ * Choose the rectangular zone arrangement.
+ * Studios with doors obey the hard rules (living at the entrance, kitchen
+ * north, bed nearest the bathroom door). Every arrangement is then scored
+ * on how many of each kind's CORE items (sofa/TV/coffee, beds, counters)
+ * sit inside their zone, then on the ratio areas. Every piece order ×
+ * kind order × group split is tried.
+ */
+function computeRectangularZones(
+  room: GeneratedRoom,
+  pieces: Rect[],
+  kinds: Array<{ kind: ZoneKind; weight: number; centroid: { x: number; y: number } }>,
+  coreGroups: Record<ZoneKind, PlacedFurniture[]>,
+  entrancePoint: { x: number; y: number } | null,
+  bathDoorPoint: { x: number; y: number } | null
+): RoomZone[] {
+  const totalA = pieces.reduce((s, p) => s + rectArea(p), 0);
+  const totalW = kinds.reduce((s, k) => s + k.weight, 0) || 1;
+  const targetArea = (k: typeof kinds[0]) => (k.weight / totalW) * totalA;
+  const MUST = 1e6;        // hard door-rule penalty (dominates everything else)
+  const FIT_PENALTY = 1e4; // one core item outside its zone (dominates area dev)
+  const AREA_PENALTY = 1;  // per m² mismatch — keeps the ratios as exact as possible
+
+  let best: { zones: RoomZone[]; score: number } | null = null;
+
+  for (const pieceOrder of permutations(pieces.map((_, i) => i))) {
+    for (const kindOrder of permutations(kinds.map((_, i) => i))) {
+      for (const groupSizes of compositions(kinds.length, pieceOrder.length)) {
+        const zones = buildRectZones(room.name, pieces, kinds, pieceOrder, kindOrder, groupSizes);
+        let score = 0;
+
+        const nearestTo = (p: { x: number; y: number }): RoomZone => {
+          let nearest = zones[0];
+          let bestDist = Infinity;
+          for (const z of zones) {
+            const d = pointToZoneDist(p, z);
+            if (d < bestDist) { bestDist = d; nearest = z; }
+          }
+          return nearest;
+        };
+
+        if (entrancePoint) {
+          const n = nearestTo(entrancePoint);
+          if (kinds.some(k => k.kind === "living")) {
+            // The living zone owns the main entrance (kitchen stays north).
+            if (n.kind !== "living") score += MUST;
+          } else if (n.kind === "bed") {
+            score += MUST; // bed must NEVER own the entrance
+          }
+        }
+        if (bathDoorPoint) {
+          if (nearestTo(bathDoorPoint).kind !== "bed") score += MUST; // bed owns the bathroom side
+        }
+
+        // Furniture fit: each kind's core items should sit INSIDE their zone.
+        for (const z of zones) {
+          for (const it of coreGroups[z.kind] ?? []) {
+            const d = pointToZoneDist(it, z);
+            if (d > 1e-9) score += FIT_PENALTY + Math.sqrt(d);
+          }
+        }
+
+        // Area ratios stay as close to the targets as the rectangles allow.
+        for (const k of kinds) {
+          const area = zones
+            .filter(z => z.kind === k.kind)
+            .reduce((s, z) => s + z.width * z.height, 0);
+          score += AREA_PENALTY * Math.abs(area - targetArea(k));
+        }
+
+        if (!best || score < best.score) best = { zones, score };
+      }
+    }
+  }
+  return best ? best.zones : [];
+}
+
 /**
  * Compute the color-coded functional zones.
  * Called AFTER furniture placement — each zone is sized by the ratios above
@@ -481,7 +697,7 @@ function groupCentroid(items: PlacedFurniture[], fallback: { x: number; y: numbe
  */
 export function computeRoomZones(
   rooms: GeneratedRoom[],
-  _doors: Door[],
+  doors: Door[],
   _windows: Window[],
   furniture: PlacedFurniture[]
 ): RoomZone[] {
@@ -511,8 +727,8 @@ export function computeRoomZones(
     if (usableArea < 1) continue;
 
     const inRoom = furniture.filter(pf => pf.room === room.name);
-    const beds = inRoom.filter(pf => isBedId(pf.itemId));
-    const kitchenItems = inRoom.filter(pf => isKitchenId(pf.itemId));
+    const beds = inRoom.filter(pf => isBedItemId(pf.itemId));
+    const kitchenItems = inRoom.filter(pf => isKitchenItemId(pf.itemId));
 
     // Rugs and side tables: in a studio they belong to the bed group when
     // near a bed, otherwise to the living group.
@@ -520,7 +736,7 @@ export function computeRoomZones(
     const nearAnyBed = (pf: PlacedFurniture) =>
       bedCentroids.some(b => Math.abs(pf.x - b.x) < 1.8 && Math.abs(pf.y - b.y) < 1.8);
     const livingItems = inRoom.filter(pf => {
-      if (!isLivingId(pf.itemId)) return false;
+      if (!isLivingItemId(pf.itemId)) return false;
       if (!isStudioRoom) return true;
       if (pf.itemId === "side-table" || pf.itemId.startsWith("rug-")) return nearAnyBed(pf);
       return true;
@@ -531,15 +747,19 @@ export function computeRoomZones(
 
     if (isStudioRoom) {
       if (usableArea >= STUDIO_THREE_ZONE_MIN) {
+        // Living carved FIRST → it takes the band the living set actually
+        // occupies (TV against the bottom wall); bed carved LAST → the top
+        // band where the bed sits. This keeps zones aligned with furniture
+        // so the placer's zone enforcement never has to relocate the set.
         kinds.push(
-          { kind: "bed", weight: 15, centroid: groupCentroid(beds, center) },
-          { kind: "kitchen", weight: 7, centroid: groupCentroid(kitchenItems, center) },
           { kind: "living", weight: 18, centroid: groupCentroid(livingItems, center) },
+          { kind: "kitchen", weight: 7, centroid: groupCentroid(kitchenItems, center) },
+          { kind: "bed", weight: 15, centroid: groupCentroid(beds, center) },
         );
       } else if (usableArea >= STUDIO_TWO_ZONE_MIN) {
         kinds.push(
-          { kind: "bed", weight: 1, centroid: groupCentroid(beds, center) },
           { kind: "living", weight: 2, centroid: groupCentroid(livingItems, center) },
+          { kind: "bed", weight: 1, centroid: groupCentroid(beds, center) },
         );
       } else {
         // Too small for anything else — the whole space is the sleeping area.
@@ -547,15 +767,52 @@ export function computeRoomZones(
       }
     } else {
       // One-bedroom open-plan living room: kitchen : living = 13 : 27.
+      // Living carved first so it follows the TV wall arrangement.
       kinds.push(
-        { kind: "kitchen", weight: 13, centroid: groupCentroid(kitchenItems, center) },
         { kind: "living", weight: 27, centroid: groupCentroid(livingItems, center) },
+        { kind: "kitchen", weight: 13, centroid: groupCentroid(kitchenItems, center) },
       );
     }
 
-    const slots = carveSlots(pieces, kinds.map(k => k.weight));
-    reshapeSliverStrips(slots, pieces);
-    zones.push(...assignKinds(room.name, slots, kinds, holes));
+    // All zones are plain RECTANGLES — one rectangle per zone, like rooms
+    // with invisible walls (no L-shapes, no split pieces). The best
+    // piece/kind/band arrangement is chosen:
+    //   - studios with doors: living/kitchen at the entrance, bed nearest
+    //     the bathroom door (hard rules);
+    //   - otherwise: zones stay closest to their furniture, with the ratio
+    //     areas kept as exact as the geometry allows.
+    let entrancePoint: { x: number; y: number } | null = null;
+    let bathDoorPoint: { x: number; y: number } | null = null;
+    if (isStudioRoom) {
+      const entranceDoor = doors.find(d => d.room === room.name);
+      entrancePoint = entranceDoor ? doorWorldPoint(entranceDoor, room) : null;
+      const bathRoom = rooms.find(r => r !== room &&
+        /bathroom|ensuite|powder|wc/i.test(r.name) &&
+        r.x < roomRect.x + roomRect.w && r.x + r.width > roomRect.x &&
+        r.y < roomRect.y + roomRect.h && r.y + r.height > roomRect.y);
+      const bathDoor = bathRoom ? doors.find(d => d.room === bathRoom.name) : undefined;
+      bathDoorPoint = bathDoor ? doorWorldPoint(bathDoor, bathRoom) : null;
+    }
+
+    if (compositions(kinds.length, pieces.length).length > 0) {
+      // Core items drive the zone placement: sofa/TV/coffee for the living
+      // zone, beds for the bed zone, counters/appliances for the kitchen.
+      const coreGroups: Record<ZoneKind, PlacedFurniture[]> = {
+        bed: beds,
+        kitchen: kitchenItems,
+        living: livingItems.filter(pf =>
+          pf.itemId.startsWith("sofa-") ||
+          pf.itemId === "tv-unit" ||
+          pf.itemId === "coffee-table"),
+      };
+      zones.push(...computeRectangularZones(room, pieces, kinds, coreGroups, entrancePoint, bathDoorPoint));
+    } else {
+      // More free-space pieces than zones (rare/impossible for carved corner
+      // bathrooms) — fall back to the contiguous-band cut.
+      const slots = carveSlots(pieces, kinds.map(k => k.weight));
+      reshapeSliverStrips(slots, pieces);
+      zones.push(...assignKinds(room.name, slots, kinds, holes));
+    }
   }
 
   return zones;

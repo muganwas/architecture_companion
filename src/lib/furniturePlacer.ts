@@ -24,6 +24,10 @@ import { GeneratedRoom, Door, Window } from "./ai-client";
 import { PlacedFurniture, FurnitureItem, FurnitureOrientation } from "./furniture";
 import { getFurnitureForRoom, getFurnitureById } from "./furniture";
 import { isFurnitureInBounds } from "./layoutEngine";
+import {
+  computeRoomZones, RoomZone,
+  isLivingItemId, isBedItemId, boxInsideZone,
+} from "./roomZones";
 
 /* ------------------------------------------------------------------ */
 /*  Obstruction zones (doors + windows)                                 */
@@ -3249,6 +3253,168 @@ export function suggestFurniture(rooms: GeneratedRoom[], doors: Door[] = [], win
       const idx = validated.indexOf(pf);
       if (idx >= 0) validated.splice(idx, 1);
       console.log(`[enforce] ${pf.itemId} in "${pf.room}" → REMOVED (blocks door clearance — hard NO)`);
+    }
+  }
+
+  // ── Zone enforcement: living furniture must stay inside the living zone ──
+  // The color-coded zones (bed/living/kitchen) are computed from the current
+  // placement. Any living-group item whose bounding box crosses into another
+  // zone is repaired: first the whole living set is translated as ONE rigid
+  // group (sofa ↔ TV ↔ coffee alignment preserved), then per-item fallback.
+  const computedZones = computeRoomZones(rooms, doors, windows, validated);
+  const zonesByRoom = new Map<string, RoomZone[]>();
+  for (const z of computedZones) {
+    const list = zonesByRoom.get(z.room);
+    if (list) list.push(z); else zonesByRoom.set(z.room, [z]);
+  }
+
+  for (const room of rooms) {
+    const zoneList = zonesByRoom.get(room.name) || [];
+    const livingZone: RoomZone | undefined = zoneList.find(z => z.kind === "living");
+    if (!livingZone || livingZone.rects.length === 0) continue;
+
+    const roomItems = validated.filter(pf => pf.room === room.name);
+    const beds = roomItems.filter(pf => isBedItemId(pf.itemId));
+    const nearAnyBed = (pf: PlacedFurniture) =>
+      beds.some(b => Math.abs(pf.x - b.x) < 1.8 && Math.abs(pf.y - b.y) < 1.8);
+
+    // Mirror computeRoomZones' grouping: in a studio, side tables and rugs
+    // that sit near a bed belong to the BED group, not the living group.
+    const isStudio = /studio/i.test(room.name);
+    const livingItems = roomItems.filter(pf => {
+      if (!isLivingItemId(pf.itemId)) return false;
+      if (pf.itemId === "side-table" || pf.itemId.startsWith("rug-")) {
+        return isStudio ? !nearAnyBed(pf) : true;
+      }
+      return true;
+    });
+    if (livingItems.length === 0) continue;
+
+    // Rotation-aware bounding box (same formula as the validation pass).
+    const aabb = (pf: PlacedFurniture): { w: number; h: number } => {
+      const item = getFurnitureById(pf.itemId);
+      if (!item) return { w: 0, h: 0 };
+      const rad = (pf.rotation * Math.PI) / 180;
+      return {
+        w: (Math.abs(item.width * Math.cos(rad)) + Math.abs(item.height * Math.sin(rad))) * pf.scale,
+        h: (Math.abs(item.width * Math.sin(rad)) + Math.abs(item.height * Math.cos(rad))) * pf.scale,
+      };
+    };
+    const insideLivingZone = (pf: PlacedFurniture): boolean => {
+      const { w, h } = aabb(pf);
+      return boxInsideZone(pf.x - w / 2, pf.y - h / 2, w, h, livingZone!.rects);
+    };
+    if (livingItems.every(insideLivingZone)) continue;
+
+    const roomDoorZones = splitZones(obstructionZonesByRoom.get(room.name) || []).doorZones;
+
+    // ── 1. Rigid group shift ──
+    // Translate the entire living set so every member sits fully inside the
+    // living zone. Candidates are anchor points (sofa center) sampled on a
+    // grid inside the zone; the smallest shift is tried first.
+    const anchor = livingItems.find(pf => pf.itemId.startsWith("sofa-")) ?? livingItems[0];
+    const nonLiving = validated.filter(pf => pf.room === room.name && !livingItems.includes(pf));
+
+    const anchorCandidates: Array<{ x: number; y: number }> = [];
+    const STEP = 0.3;
+    for (const r of livingZone.rects) {
+      for (let gx = r.x + STEP / 2; gx < r.x + r.width; gx += STEP) {
+        for (let gy = r.y + STEP / 2; gy < r.y + r.height; gy += STEP) {
+          anchorCandidates.push({ x: gx, y: gy });
+        }
+      }
+      anchorCandidates.push({ x: r.x + r.width / 2, y: r.y + r.height / 2 });
+    }
+    anchorCandidates.sort((a, b) =>
+      ((a.x - anchor.x) ** 2 + (a.y - anchor.y) ** 2) -
+      ((b.x - anchor.x) ** 2 + (b.y - anchor.y) ** 2));
+
+    const groupValidAt = (dx: number, dy: number): boolean => {
+      for (const pf of livingItems) {
+        const { w, h } = aabb(pf);
+        const nx = pf.x + dx;
+        const ny = pf.y + dy;
+        if (!boxInsideZone(nx - w / 2, ny - h / 2, w, h, livingZone!.rects)) return false;
+        if (!isFurnitureInBounds(nx, ny, w, h, room)) return false;
+        if (collidesWithExisting(nx, ny, w, h, room.name, nonLiving, pf.itemId)) return false;
+        if (roomDoorZones.length > 0 && overlapsObstruction(nx, ny, w / 2, h / 2, roomDoorZones)) return false;
+      }
+      return true;
+    };
+
+    let groupShifted = false;
+    for (const c of anchorCandidates) {
+      const dx = c.x - anchor.x;
+      const dy = c.y - anchor.y;
+      if (!groupValidAt(dx, dy)) continue;
+      for (const pf of livingItems) {
+        pf.x += dx;
+        pf.y += dy;
+      }
+      groupShifted = true;
+      console.log(`[zone-enforce] "${room.name}" living set shifted (${dx.toFixed(2)},${dy.toFixed(2)}) into living zone`);
+      break;
+    }
+    if (groupShifted) continue;
+
+    // ── 2. Per-item fallback ──
+    // Members still outside the zone are relocated individually inside it.
+    // Essential items (sofa/TV/coffee) may shrink; decorative items
+    // (armchair/side-table/rug) are dropped when no spot fits.
+    for (const pf of [...livingItems]) {
+      if (insideLivingZone(pf)) continue;
+      const item = getFurnitureById(pf.itemId);
+      if (!item) continue;
+      const isEssential = essentialIds.has(pf.itemId);
+
+      const spots: Array<{ x: number; y: number }> = [];
+      const STEP2 = 0.25;
+      for (const r of livingZone.rects) {
+        for (let gx = r.x + STEP2 / 2; gx < r.x + r.width; gx += STEP2) {
+          for (let gy = r.y + STEP2 / 2; gy < r.y + r.height; gy += STEP2) {
+            spots.push({ x: gx, y: gy });
+          }
+        }
+        spots.push({ x: r.x + r.width / 2, y: r.y + r.height / 2 });
+      }
+      spots.sort((a, b) =>
+        ((a.x - pf.x) ** 2 + (a.y - pf.y) ** 2) -
+        ((b.x - pf.x) ** 2 + (b.y - pf.y) ** 2));
+
+      const scales = isEssential ? [pf.scale, 0.85, 0.7, 0.6] : [pf.scale];
+      const rotations = ([pf.rotation, 0, 90, 180, 270] as FurnitureOrientation[])
+        .filter((r, i, arr) => arr.indexOf(r) === i);
+      const others = validated.filter(v => v !== pf);
+
+      let repaired: PlacedFurniture | null = null;
+      outer:
+      for (const s of scales) {
+        for (const rot of rotations) {
+          const rad = (rot * Math.PI) / 180;
+          const w = (Math.abs(item.width * Math.cos(rad)) + Math.abs(item.height * Math.sin(rad))) * s;
+          const h = (Math.abs(item.width * Math.sin(rad)) + Math.abs(item.height * Math.cos(rad))) * s;
+          for (const sp of spots) {
+            if (!boxInsideZone(sp.x - w / 2, sp.y - h / 2, w, h, livingZone!.rects)) continue;
+            if (!isFurnitureInBounds(sp.x, sp.y, w, h, room)) continue;
+            if (collidesWithExisting(sp.x, sp.y, w, h, room.name, others, pf.itemId)) continue;
+            if (roomDoorZones.length > 0 && overlapsObstruction(sp.x, sp.y, w / 2, h / 2, roomDoorZones)) continue;
+            repaired = { itemId: pf.itemId, room: room.name, x: sp.x, y: sp.y, rotation: rot, scale: s };
+            break outer;
+          }
+        }
+      }
+
+      if (repaired) {
+        const idx = validated.indexOf(pf);
+        validated[idx] = repaired;
+        console.log(`[zone-enforce] ${pf.itemId} in "${room.name}" → moved into living zone`);
+      } else if (!isEssential) {
+        const idx = validated.indexOf(pf);
+        if (idx >= 0) validated.splice(idx, 1);
+        console.log(`[zone-enforce] ${pf.itemId} in "${room.name}" → DROPPED (no spot inside living zone)`);
+      } else {
+        console.log(`[zone-enforce] ${pf.itemId} in "${room.name}" ⚠️ kept out of zone (no valid spot)`);
+      }
     }
   }
 

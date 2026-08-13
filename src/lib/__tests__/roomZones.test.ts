@@ -3,9 +3,10 @@
 /* ------------------------------------------------------------------ */
 
 import { describe, it, expect } from "vitest";
-import { computeRoomZones, RoomZone, ZoneRect } from "../roomZones";
+import { computeRoomZones, RoomZone, ZoneRect, isLivingItemId, isBedItemId, boxInsideZone } from "../roomZones";
 import { suggestFurniture } from "../furniturePlacer";
-import { GeneratedRoom } from "../ai-client";
+import { GeneratedRoom, Door } from "../ai-client";
+import { PlacedFurniture, getFurnitureById } from "../furniture";
 
 function makeRoom(overrides: Partial<GeneratedRoom>): GeneratedRoom {
   return {
@@ -149,6 +150,251 @@ describe("computeRoomZones", () => {
         if (!touching) connected = false;
       }
       expect(connected, `${z.kind} zone must be one contiguous space (bottom-left bathroom)`).toBe(true);
+    }
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/*  Zone enforcement: living furniture must stay inside the living zone */
+/* ------------------------------------------------------------------ */
+
+/** Rotation-aware bounding box (same formula as the placer's validation). */
+function furnitureAabb(pf: PlacedFurniture): { w: number; h: number } {
+  const item = getFurnitureById(pf.itemId)!;
+  const rad = (pf.rotation * Math.PI) / 180;
+  return {
+    w: (Math.abs(item.width * Math.cos(rad)) + Math.abs(item.height * Math.sin(rad))) * pf.scale,
+    h: (Math.abs(item.width * Math.sin(rad)) + Math.abs(item.height * Math.cos(rad))) * pf.scale,
+  };
+}
+
+/** Living-group items, mirroring the placer's studio bed-side rules. */
+function livingGroup(furniture: PlacedFurniture[], roomName: string): PlacedFurniture[] {
+  const beds = furniture.filter(pf => pf.room === roomName && isBedItemId(pf.itemId));
+  return furniture.filter(pf => {
+    if (pf.room !== roomName || !isLivingItemId(pf.itemId)) return false;
+    if (pf.itemId === "side-table" || pf.itemId.startsWith("rug-")) {
+      const nearBed = beds.some(b =>
+        Math.abs(pf.x - b.x) < 1.8 && Math.abs(pf.y - b.y) < 1.8);
+      return !nearBed;
+    }
+    return true;
+  });
+}
+
+describe("zone enforcement (living furniture)", () => {
+  function expectLivingInsideZone(rooms: GeneratedRoom[], roomName: string) {
+    const furniture = suggestFurniture(rooms);
+    const zones = computeRoomZones(rooms, [], [], furniture);
+    const living = zones.find(z => z.room === roomName && z.kind === "living");
+    expect(living, `expected a living zone in "${roomName}"`).toBeDefined();
+
+    const items = livingGroup(furniture, roomName);
+    expect(items.length, "expected living furniture in the room").toBeGreaterThan(0);
+
+    for (const pf of items) {
+      const { w, h } = furnitureAabb(pf);
+      expect(
+        boxInsideZone(pf.x - w / 2, pf.y - h / 2, w, h, living!.rects),
+        `${pf.itemId} at (${pf.x.toFixed(2)}, ${pf.y.toFixed(2)}) must lie fully inside the living zone`
+      ).toBe(true);
+    }
+  }
+
+  function expectLivingNotInKitchenZone(rooms: GeneratedRoom[], roomName: string) {
+    const furniture = suggestFurniture(rooms);
+    const zones = computeRoomZones(rooms, [], [], furniture);
+    const living = zones.find(z => z.room === roomName && z.kind === "living");
+    const kitchen = zones.find(z => z.room === roomName && z.kind === "kitchen");
+    if (!living || !kitchen) return; // no kitchen zone in this configuration
+
+    for (const pf of livingGroup(furniture, roomName)) {
+      const { w, h } = furnitureAabb(pf);
+      const box: ZoneRect = { x: pf.x - w / 2, y: pf.y - h / 2, width: w, height: h };
+      const overlapsKitchen = kitchen.rects.some(r => rectsOverlap(box, r));
+      expect(overlapsKitchen,
+        `${pf.itemId} must not overlap the kitchen zone`).toBe(false);
+    }
+  }
+
+  it("studio living furniture stays fully inside the living zone (carved bathroom)", () => {
+    const studio = makeRoom({ name: "Studio", width: 5.7, height: 5.7, area: 30, hasKitchenZone: true });
+    const bathroom = makeRoom({ name: "Bathroom", x: 0, y: 2.8, width: 2.0, height: 2.9, area: 5.8 });
+    expectLivingInsideZone([studio, bathroom], "Studio");
+    expectLivingNotInKitchenZone([studio, bathroom], "Studio");
+  });
+
+  it("one-bedroom open-plan living furniture stays fully inside the living zone", () => {
+    const living = makeRoom({ name: "Living Room", width: 6, height: 5, area: 30, hasKitchenZone: true });
+    const bedroom = makeRoom({ name: "Bedroom 1", x: 6, y: 0, width: 3.5, height: 4, area: 14 });
+    const bathroom = makeRoom({ name: "Bathroom", x: 0, y: 5, width: 2.2, height: 2, area: 4.4 });
+    expectLivingInsideZone([living, bedroom, bathroom], "Living Room");
+    expectLivingNotInKitchenZone([living, bedroom, bathroom], "Living Room");
+  });
+
+  it("studio with a bottom-left bathroom keeps living furniture in its zone", () => {
+    const studio = makeRoom({ name: "Studio", width: 5.7, height: 5.7, area: 30, hasKitchenZone: true });
+    const bathroom = makeRoom({ name: "Bathroom", x: 0, y: 0, width: 2.0, height: 2.9, area: 5.8 });
+    expectLivingInsideZone([studio, bathroom], "Studio");
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/*  Studio door rules: living/kitchen at the entrance, bed by bath door */
+/* ------------------------------------------------------------------ */
+
+function nearestZoneTo(zones: RoomZone[], p: { x: number; y: number }): RoomZone | null {
+  let best: RoomZone | null = null;
+  let bestDist = Infinity;
+  for (const z of zones) {
+    let d = Infinity;
+    for (const r of z.rects) {
+      const cx = Math.max(r.x, Math.min(p.x, r.x + r.width));
+      const cy = Math.max(r.y, Math.min(p.y, r.y + r.height));
+      d = Math.min(d, (p.x - cx) ** 2 + (p.y - cy) ** 2);
+    }
+    if (d < bestDist) { bestDist = d; best = z; }
+  }
+  return best;
+}
+
+function doorPoint(door: Door, room: GeneratedRoom): { x: number; y: number } {
+  switch (door.wall) {
+    case "bottom": return { x: room.x + door.offset, y: room.y };
+    case "top": return { x: room.x + door.offset, y: room.y + room.height };
+    case "left": return { x: room.x, y: room.y + door.offset };
+    case "right": return { x: room.x + room.width, y: room.y + door.offset };
+  }
+}
+
+describe("studio door rules", () => {
+  it("living or kitchen zone owns the main entrance, bed zone owns the bathroom door", () => {
+    const studio = makeRoom({ name: "Studio", width: 6, height: 6, area: 36, hasKitchenZone: true });
+    const bathroom = makeRoom({ name: "Bathroom", x: 3.8, y: 3.8, width: 2.2, height: 2.2, area: 4.8 });
+    const entrance: Door = { room: "Studio", wall: "bottom", offset: 3, width: 1, swing: "in" };
+    const bathDoor: Door = { room: "Bathroom", wall: "left", offset: 1.1, width: 0.8, swing: "in" };
+
+    const furniture = suggestFurniture([studio, bathroom], [entrance, bathDoor]);
+    const zones = computeRoomZones([studio, bathroom], [entrance, bathDoor], [], furniture)
+      .filter(z => z.room === "Studio");
+
+    const entranceZone = nearestZoneTo(zones, doorPoint(entrance, studio))!;
+    expect(["living", "kitchen"], "entrance must be owned by living or kitchen").toContain(entranceZone.kind);
+
+    const bathZone = nearestZoneTo(zones, doorPoint(bathDoor, bathroom))!;
+    expect(bathZone.kind, "bed zone must be closest to the bathroom door").toBe("bed");
+  });
+
+  it("side-wall entrance keeps living/kitchen at the entrance and bed at the bathroom", () => {
+    const studio = makeRoom({ name: "Studio", width: 6, height: 6, area: 36, hasKitchenZone: true });
+    const bathroom = makeRoom({ name: "Bathroom", x: 3.8, y: 0, width: 2.2, height: 2.2, area: 4.8 });
+    const entrance: Door = { room: "Studio", wall: "left", offset: 3, width: 1, swing: "in" };
+    const bathDoor: Door = { room: "Bathroom", wall: "top", offset: 1.1, width: 0.8, swing: "in" };
+
+    const furniture = suggestFurniture([studio, bathroom], [entrance, bathDoor]);
+    const zones = computeRoomZones([studio, bathroom], [entrance, bathDoor], [], furniture)
+      .filter(z => z.room === "Studio");
+
+    const entranceZone = nearestZoneTo(zones, doorPoint(entrance, studio))!;
+    expect(["living", "kitchen"], "entrance must be owned by living or kitchen").toContain(entranceZone.kind);
+
+    const bathZone = nearestZoneTo(zones, doorPoint(bathDoor, bathroom))!;
+    expect(bathZone.kind, "bed zone must be closest to the bathroom door").toBe("bed");
+  });
+
+  it("top-wall entrance pushes living/kitchen to the back wall, bed stays by the bathroom", () => {
+    const studio = makeRoom({ name: "Studio", width: 6, height: 6, area: 36, hasKitchenZone: true });
+    const bathroom = makeRoom({ name: "Bathroom", x: 0, y: 0, width: 2.2, height: 2.2, area: 4.8 });
+    const entrance: Door = { room: "Studio", wall: "top", offset: 3, width: 1, swing: "in" };
+    const bathDoor: Door = { room: "Bathroom", wall: "right", offset: 1.1, width: 0.8, swing: "in" };
+
+    const furniture = suggestFurniture([studio, bathroom], [entrance, bathDoor]);
+    const zones = computeRoomZones([studio, bathroom], [entrance, bathDoor], [], furniture)
+      .filter(z => z.room === "Studio");
+
+    const entranceZone = nearestZoneTo(zones, doorPoint(entrance, studio))!;
+    expect(["living", "kitchen"], "entrance must be owned by living or kitchen").toContain(entranceZone.kind);
+
+    const bathZone = nearestZoneTo(zones, doorPoint(bathDoor, bathroom))!;
+    expect(bathZone.kind, "bed zone must be closest to the bathroom door").toBe("bed");
+  });
+
+  it("no zone splits into separate pieces (bathroom at bottom-left, entrance at bottom)", () => {
+    // Reported bug: the living zone was rendered as TWO separate regions —
+    // one northern piece and one southern piece. Zones must behave like
+    // rooms with invisible walls: ONE contiguous space each, kitchen to the
+    // north, living at the entrance, bed by the bathroom door.
+    const studio = makeRoom({ name: "Studio", width: 5.7, height: 5.7, area: 32, hasKitchenZone: true });
+    const bathroom = makeRoom({ name: "Bathroom", x: 0, y: 0, width: 2.0, height: 3.0, area: 6 });
+    const entrance: Door = { room: "Studio", wall: "bottom", offset: 2.85, width: 1, swing: "in" };
+    const bathDoor: Door = { room: "Bathroom", wall: "top", offset: 1.0, width: 0.8, swing: "in" };
+
+    const furniture = suggestFurniture([studio, bathroom], [entrance, bathDoor]);
+    const zones = computeRoomZones([studio, bathroom], [entrance, bathDoor], [], furniture)
+      .filter(z => z.room === "Studio");
+
+    // Every zone is a SINGLE rectangle — zones are rooms with invisible walls.
+    for (const z of zones) {
+      expect(z.rects.length, `${z.kind} zone must be a single rectangle`).toBe(1);
+    }
+
+    // Living owns the entrance (south), kitchen sits to the north of it.
+    const entranceZone = nearestZoneTo(zones, doorPoint(entrance, studio))!;
+    expect(entranceZone.kind, "living zone should own the main entrance").toBe("living");
+
+    const kitchenZone = zones.find(z => z.kind === "kitchen")!;
+    const livingZone = zones.find(z => z.kind === "living")!;
+    expect(kitchenZone.y + kitchenZone.height / 2,
+      "kitchen should be north of the living zone"
+    ).toBeGreaterThan(livingZone.y + livingZone.height / 2);
+
+    const bathZone = nearestZoneTo(zones, doorPoint(bathDoor, bathroom))!;
+    expect(bathZone.kind, "bed zone must be closest to the bathroom door").toBe("bed");
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/*  All zones are plain rectangles — no L-shapes, no split pieces      */
+/* ------------------------------------------------------------------ */
+
+describe("zones are plain rectangles", () => {
+  it("studio zones are single rectangles with a carved bathroom (no doors)", () => {
+    const studio = makeRoom({ name: "Studio", width: 5.7, height: 5.7, area: 30, hasKitchenZone: true });
+    const bathroom = makeRoom({ name: "Bathroom", x: 0, y: 2.8, width: 2.0, height: 2.9, area: 5.8 });
+    const furniture = suggestFurniture([studio, bathroom]);
+    const zones = computeRoomZones([studio, bathroom], [], [], furniture)
+      .filter(z => z.room === "Studio");
+
+    expect(zones.length).toBeGreaterThanOrEqual(2);
+    for (const z of zones) {
+      expect(z.rects.length, `${z.kind} zone must be a single rectangle`).toBe(1);
+    }
+  });
+
+  it("one-bedroom open-plan living zones are single rectangles", () => {
+    const living = makeRoom({ name: "Living Room", width: 6, height: 5, area: 30, hasKitchenZone: true });
+    const bedroom = makeRoom({ name: "Bedroom 1", x: 6, y: 0, width: 3.5, height: 4, area: 14 });
+    const furniture = suggestFurniture([living, bedroom]);
+    const zones = computeRoomZones([living, bedroom], [], [], furniture)
+      .filter(z => z.room === "Living Room");
+
+    expect(zones.length).toBe(2);
+    for (const z of zones) {
+      expect(z.rects.length, `${z.kind} zone must be a single rectangle`).toBe(1);
+    }
+  });
+
+  it("studio zones are single rectangles when the bathroom is at the bottom-left", () => {
+    const studio = makeRoom({ name: "Studio", width: 5.7, height: 5.7, area: 32, hasKitchenZone: true });
+    const bathroom = makeRoom({ name: "Bathroom", x: 0, y: 0, width: 2.0, height: 3.0, area: 6 });
+    const entrance: Door = { room: "Studio", wall: "bottom", offset: 2.85, width: 1, swing: "in" };
+    const bathDoor: Door = { room: "Bathroom", wall: "top", offset: 1.0, width: 0.8, swing: "in" };
+    const furniture = suggestFurniture([studio, bathroom], [entrance, bathDoor]);
+    const zones = computeRoomZones([studio, bathroom], [entrance, bathDoor], [], furniture)
+      .filter(z => z.room === "Studio");
+
+    for (const z of zones) {
+      expect(z.rects.length, `${z.kind} zone must be a single rectangle`).toBe(1);
     }
   });
 });
