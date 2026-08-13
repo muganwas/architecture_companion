@@ -1,28 +1,37 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, useSyncExternalStore } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
 import FloorPlanCanvas from "@/components/FloorPlanCanvas";
 import Sidebar from "@/components/Sidebar";
 import type { FloorPlanResult, GeneratedRoom } from "@/lib/ai-client";
 
+// One-shot sessionStorage snapshot (stable between reads so React doesn't re-render forever)
+let cachedRaw: string | null = null;
+let cachedResult: FloorPlanResult | null = null;
+const readResultSnapshot = (): FloorPlanResult | null => {
+  const raw = sessionStorage.getItem("archResult");
+  if (raw === cachedRaw) return cachedResult;
+  cachedRaw = raw;
+  cachedResult = raw ? (JSON.parse(raw) as FloorPlanResult) : null;
+  return cachedResult;
+};
+const subscribeToStorage = () => () => {};
+
 export default function ResultsPage() {
   const router = useRouter();
-  const [result, setResult] = useState<FloorPlanResult | null>(null);
+  const result = useSyncExternalStore(subscribeToStorage, readResultSnapshot, () => null);
   const [viewMode, setViewMode] = useState<"2d" | "3d">("2d");
   const [style, setStyle] = useState("modern");
   const [hoveredRoom, setHoveredRoom] = useState<GeneratedRoom | null>(null);
   const [hoveredFurniture, setHoveredFurniture] = useState<{ name: string; room: string } | null>(null);
 
   useEffect(() => {
-    const raw = sessionStorage.getItem("archResult");
-    if (!raw) {
+    if (!result) {
       router.push("/input");
-      return;
     }
-    setResult(JSON.parse(raw));
-  }, [router]);
+  }, [result, router]);
 
   const handleRegenerate = () => {
     router.push("/processing");
@@ -84,7 +93,7 @@ export default function ResultsPage() {
         <div className="flex-1 flex flex-col items-center gap-4">
           {/* Validation warnings — advisory only */}
           {result.warnings && result.warnings.length > 0 && (
-            <div className="w-full max-w-[640px] bg-amber-50 border border-amber-200 rounded-xl p-4">
+            <div className="w-full max-w-160 bg-amber-50 border border-amber-200 rounded-xl p-4">
               <div className="flex items-start gap-2.5">
                 <svg className="w-5 h-5 text-amber-500 mt-0.5 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                   <circle cx="12" cy="12" r="10" />
@@ -108,6 +117,7 @@ export default function ResultsPage() {
             doors={result.doors || []}
             windows={result.windows || []}
             placedFurniture={result.placedFurniture}
+            roomZones={result.roomZones}
             buildingPolygon={result.buildingPolygon}
             entranceApproach={result.entranceApproach}
             viewMode={viewMode}

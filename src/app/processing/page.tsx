@@ -23,7 +23,6 @@ export default function ProcessingPage() {
 
     const input = JSON.parse(raw);
 
-    // eslint-disable-next-line react-hooks/set-state-in-effect
     fetch("/api/generate", {
       method: "POST",
       headers: { "Content-Type": "application/json" },

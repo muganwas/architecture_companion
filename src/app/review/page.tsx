@@ -28,22 +28,26 @@ export default function ReviewPage() {
       router.push("/input");
       return;
     }
-    const input = JSON.parse(raw);
+    const input = JSON.parse(raw) as { mode?: string; description?: string };
 
-    if (input.mode === "sketch") {
-      setIsSketch(true);
-      // For sketches, build a full default description
-      const defaultDesc = buildDefaultDescription(input.description || "");
-      const result = analyzePrompt(defaultDesc);
-      setAnalysis(result);
-      setDescription(defaultDesc);
-      setEditedPrompt(defaultDesc);
-    } else {
-      const result = analyzePrompt(input.description || "");
-      setAnalysis(result);
-      setDescription(input.description);
-      setEditedPrompt(input.description);
-    }
+    // Defer state sync out of the synchronous effect body (React discourages
+    // synchronous setState in effects — this is a one-shot external read).
+    queueMicrotask(() => {
+      if (input.mode === "sketch") {
+        setIsSketch(true);
+        // For sketches, build a full default description
+        const defaultDesc = buildDefaultDescription(input.description || "");
+        const result = analyzePrompt(defaultDesc);
+        setAnalysis(result);
+        setDescription(defaultDesc);
+        setEditedPrompt(defaultDesc);
+      } else {
+        const result = analyzePrompt(input.description || "");
+        setAnalysis(result);
+        setDescription(input.description || "");
+        setEditedPrompt(input.description || "");
+      }
+    });
   }, [router]);
 
   const handleProceed = () => {

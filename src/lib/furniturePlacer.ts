@@ -942,15 +942,12 @@ function placeDeskSet(
 
   // Positions to try: preferred first, then alternatives
   const positions: Array<{ x: number; y: number; rot: number }> = [];
-  const cx = room.x + room.width / 2;
-  const cy = room.y + room.height / 2;
 
   // Add the preferred position first
   positions.push({ x: preferredX, y: preferredY, rot: preferredRot });
 
   // If preferred is near back wall, add symmetric alternatives
   const nearBackWall = Math.abs(preferredY - (room.y + room.height)) < 1.0;
-  const nearFrontWall = Math.abs(preferredY - room.y) < 1.0;
   if (nearBackWall) {
     positions.push(
       { x: room.x + 0.9, y: room.y + room.height - 0.5, rot: 0 },
@@ -1267,7 +1264,6 @@ export function suggestFurniture(rooms: GeneratedRoom[], doors: Door[] = [], win
 
         if (bestCandidate) {
           const { x: bedX, y: bedY, rotation: bedRotation } = bestCandidate;
-          const wall = bestCandidate.wall;
 
           placed.push({ itemId: bedId, room: room.name, x: bedX, y: bedY, rotation: bedRotation, scale: bedScale });
 
@@ -1554,7 +1550,6 @@ export function suggestFurniture(rooms: GeneratedRoom[], doors: Door[] = [], win
         const bRight = bathroomRoom!.x + bathroomRoom!.width;
         const bTop = bathroomRoom!.y + bathroomRoom!.height;
         const wardScale = 0.8;
-        const wardHalfW = (wardrobeItem.width * wardScale) / 2;
         const wardHalfH = (wardrobeItem.height * wardScale) / 2;
 
         let wx: number, wy: number, wRot: 0 | 90 | 180 | 270;
@@ -2543,7 +2538,6 @@ export function suggestFurniture(rooms: GeneratedRoom[], doors: Door[] = [], win
       const tMargin = 0.05;
 
       // Try all 4 walls — prefer opposite door, then any that fits
-      const wallPriority: Array<{ wall: Door["wall"]; rot: number; cx: number; cy: number }> = [];
       const oppWall = doorWall === "bottom" ? "top" : doorWall === "top" ? "bottom"
         : doorWall === "left" ? "right" : "left";
 
@@ -2616,7 +2610,6 @@ export function suggestFurniture(rooms: GeneratedRoom[], doors: Door[] = [], win
         // "Left" = towards 0 along the wall, "Right" = towards alongDim.
         // Check if the sink CENTER can fit on each side of the door zone.
         const minGap = 0.02;
-        const sinkSpan = sinkHalfAlong * 2; // total space sink occupies along the wall
         const doorZoneStart = doorAlong - doorHalf;
         const doorZoneEnd = doorAlong + doorHalf;
 

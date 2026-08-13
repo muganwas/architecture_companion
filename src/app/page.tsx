@@ -30,7 +30,7 @@ export default function Home() {
   return (
     <div className="flex flex-col flex-1 bg-[#f4f5f7]">
       {/* Header */}
-      <header className="text-center py-24 px-4 bg-gradient-to-b from-blue-600 to-blue-700">
+      <header className="text-center py-24 px-4 bg-linear-to-b from-blue-600 to-blue-700">
         <svg className="w-16 h-16 mx-auto mb-6 text-white/90" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round">
           <rect x="3" y="3" width="18" height="18" rx="2" />
           <line x1="9" y1="3" x2="9" y2="21" />

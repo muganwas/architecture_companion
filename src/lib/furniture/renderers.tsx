@@ -4,7 +4,7 @@
 /* ------------------------------------------------------------------ */
 
 import React from "react";
-import { Group, Rect, Circle, Ellipse, Line, Arc, Text, RegularPolygon } from "react-konva";
+import { Group, Rect, Circle, Ellipse, Line, Text, RegularPolygon } from "react-konva";
 import { FurnitureItem } from "./types";
 
 interface RenderContext {
@@ -276,7 +276,6 @@ const renderers: Record<string, (ctx: RenderContext) => React.ReactElement> = {
 
   /* ---------- SHOWER ---------- */
   "shower": ({ item, w, h }) => {
-    const fill = item.fill;
     const stroke = item.stroke;
     return (
       <Group>

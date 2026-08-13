@@ -1,10 +1,11 @@
 "use client";
 
 import React, { useMemo, useState, useCallback } from "react";
-import { Stage, Layer, Group, Rect, Line, Circle, Text, Arc } from "react-konva";
+import { Stage, Layer, Group, Rect, Line, Circle, Text } from "react-konva";
 import { GeneratedRoom, Door, Window } from "@/lib/ai-client";
 import { getDoorClearanceRects } from "@/lib/furniturePlacer";
 import { PlacedFurniture, getFurnitureById } from "@/lib/furniture";
+import { RoomZone, ZoneKind, zoneOutlineLoops } from "@/lib/roomZones";
 
 /* ------------------------------------------------------------------ */
 /*  Types & constants                                                  */
@@ -15,6 +16,8 @@ interface FloorPlanCanvasProps {
   doors: Door[];
   windows: Window[];
   placedFurniture?: PlacedFurniture[];
+  /** Color-coded functional zones (studios + one-bedroom open-plan living rooms) */
+  roomZones?: RoomZone[];
   buildingPolygon?: Array<{ x: number; y: number }>;
   /** For apartments: where the building corridor/stairwell connects */
   entranceApproach?: { eHallX: number; eHallY: number; doorX: number; doorY: number; wall: Door["wall"] };
@@ -35,6 +38,14 @@ const FILL: Record<string, string> = {
   "living room": "#f7f3eb", kitchen: "#faf6ef", bedroom: "#f2f0f0",
   "master bedroom": "#f2f0f0", bathroom: "#f5f4fa", ensuite: "#f5f4fa",
   dining: "#faf7ef", office: "#f2f5f0", laundry: "#f8f5f8", garage: "#ebebeb",
+};
+
+/* ---------- functional zone colors ---------- */
+
+const ZONE_STYLE: Record<ZoneKind, { fill: string; stroke: string; label: string }> = {
+  bed: { fill: "rgba(139,92,246,0.12)", stroke: "#8b5cf6", label: "BED ZONE" },
+  living: { fill: "rgba(59,130,246,0.12)", stroke: "#3b82f6", label: "LIVING ZONE" },
+  kitchen: { fill: "rgba(245,158,11,0.12)", stroke: "#f59e0b", label: "KITCHEN ZONE" },
 };
 
 function fill(n: string) {
@@ -123,36 +134,31 @@ function renderDoor(
   const gapHw = door.width / 2;
   const off = door.offset;
   const isGarage = door.width >= 2.0;
-  const stopLen = 0.06;
 
   // Hinge is always on the LEFT side of the gap (standard convention)
   // Latch is on the RIGHT side
-  let hingeX: number, hingeY: number, latchX: number, latchY: number;
+  let hingeX: number, hingeY: number;
   let inDirX: number, inDirY: number; // unit vector pointing INTO the room from the wall
   let alongDirX: number, alongDirY: number; // unit vector along the wall (hinge→latch direction)
 
   switch (door.wall) {
     case "bottom":
       hingeX = rx + off - gapHw; hingeY = ry;
-      latchX = rx + off + gapHw; latchY = ry;
       inDirX = 0; inDirY = 1; // into room = up
       alongDirX = 1; alongDirY = 0; // along wall = right
       break;
     case "top":
       hingeX = rx + off - gapHw; hingeY = ry + rh;
-      latchX = rx + off + gapHw; latchY = ry + rh;
       inDirX = 0; inDirY = -1; // into room = down
       alongDirX = 1; alongDirY = 0;
       break;
     case "left":
       hingeX = rx; hingeY = ry + off - gapHw;
-      latchX = rx; latchY = ry + off + gapHw;
       inDirX = 1; inDirY = 0; // into room = right
       alongDirX = 0; alongDirY = 1; // along wall = up
       break;
     case "right":
       hingeX = rx + rw; hingeY = ry + off - gapHw;
-      latchX = rx + rw; latchY = ry + off + gapHw;
       inDirX = -1; inDirY = 0; // into room = left
       alongDirX = 0; alongDirY = 1;
       break;
@@ -322,7 +328,7 @@ function rectToScreenFlat(room: GeneratedRoom, s: number, bb: BBox): number[] {
 /* ------------------------------------------------------------------ */
 
 export default function FloorPlanCanvas({
-  rooms, doors, windows, placedFurniture, buildingPolygon, entranceApproach, viewMode, onRoomHover, onFurnitureHover,
+  rooms, doors, windows, placedFurniture, roomZones, buildingPolygon, entranceApproach, viewMode, onRoomHover, onFurnitureHover,
 }: FloorPlanCanvasProps) {
   const [hoveredKey, setHoveredKey] = useState<string | null>(null);
   const [hoveredFurnIdx, setHoveredFurnIdx] = useState<number | null>(null);
@@ -340,18 +346,6 @@ export default function FloorPlanCanvas({
     }
     return Array.from(map.entries());
   }, [rooms]);
-
-  // Furniture lookup
-  const furnByRoom = useMemo(() => {
-    const map = new Map<string, PlacedFurniture[]>();
-    if (placedFurniture) {
-      for (const pf of placedFurniture) {
-        if (!map.has(pf.room)) map.set(pf.room, []);
-        map.get(pf.room)!.push(pf);
-      }
-    }
-    return map;
-  }, [placedFurniture]);
 
   /* ================================================================ */
   /*  GRID LINES                                                       */
@@ -396,7 +390,6 @@ export default function FloorPlanCanvas({
     const rh = scaleH;
     const pos = toCanvas(pf.x, pf.y, s, bb);
 
-    const cat = item.category;
     const fillC = item.fill;
     const strokeC = item.stroke;
     const sw = 1.2; // stroke width
@@ -873,7 +866,7 @@ export default function FloorPlanCanvas({
   if (rooms.length === 0) return null;
 
   return (
-    <div className="relative w-full aspect-square max-w-[700px] mx-auto
+    <div className="relative w-full aspect-square max-w-175 mx-auto
                     bg-[#fcfcf9] rounded-xl border border-zinc-300 shadow-sm overflow-hidden"
          style={{ touchAction: "none" }}>
       <Stage width={STAGE_W} height={STAGE_H}
@@ -887,13 +880,9 @@ export default function FloorPlanCanvas({
         {/* ======== LAYER 1: Rooms + Doors + Windows ======== */}
         <Layer>
           {grouped.map(([key, parts]) => {
-            const displayName = parts[0].displayLabel || parts[0].name;
             const name = parts[0].name;
-            const center = roomCenter(parts[0]);
-            const cPx = toCanvas(center.x, center.y, s, bb);
             const isHall = /hallway|corridor|foyer/i.test(name);
             const isHovered = hoveredKey === key;
-            const totalArea = parts.reduce((sum, p) => sum + p.area, 0);
 
             return (
               <Group key={key}
@@ -919,7 +908,7 @@ export default function FloorPlanCanvas({
                 {doors.filter(d => {
                   const room = roomMap.get(d.room);
                   return room && parts.some(p => p.name === room.name);
-                }).map((door, di) => {
+                }).map((door) => {
                   const room = roomMap.get(door.room)!;
                   if (/hallway|corridor|foyer/i.test(room.name)) return null;
                   return renderDoor(room, door, s, bb);
@@ -960,6 +949,49 @@ export default function FloorPlanCanvas({
             );
           })}
         </Layer>
+
+        {/* ======== LAYER 1b: Functional zones (imaginary walls) ======== */}
+        {roomZones && roomZones.length > 0 && (
+          <Layer listening={false}>
+            {roomZones.map((z, i) => {
+              const style = ZONE_STYLE[z.kind];
+              const loops = zoneOutlineLoops(z.rects);
+              const labelPos = toCanvas(z.x + z.width / 2, z.y + z.height - 0.25, s, bb);
+              return (
+                <Group key={`zone-${i}`}>
+                  {loops.map((pts: Array<{ x: number; y: number }>, li: number) => {
+                    const flat = pts.flatMap((p: { x: number; y: number }) => {
+                      const c = toCanvas(p.x, p.y, s, bb);
+                      return [c.x, c.y];
+                    });
+                    return (
+                      <Line
+                        key={li}
+                        points={flat}
+                        closed
+                        fill={style.fill}
+                        stroke={style.stroke}
+                        strokeWidth={1.8}
+                        dash={[12, 7]}
+                        lineJoin="round"
+                      />
+                    );
+                  })}
+                  <Text
+                    x={labelPos.x - 45}
+                    y={labelPos.y - 8}
+                    text={style.label}
+                    fontSize={10}
+                    fontStyle="bold"
+                    fill={style.stroke}
+                    width={90}
+                    align="center"
+                  />
+                </Group>
+              );
+            })}
+          </Layer>
+        )}
 
         {/* ======== LAYER 2a: Rugs (below other furniture) ======== */}
         {placedFurniture && placedFurniture.length > 0 && (

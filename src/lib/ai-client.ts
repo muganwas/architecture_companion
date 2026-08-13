@@ -3,6 +3,7 @@ type AIProvider = "openai" | "deepseek";
 import { computeLayout, AbstractPlan } from "./layoutEngine";
 import { PlacedFurniture } from "./furniture";
 import { suggestFurniture } from "./furniturePlacer";
+import { computeRoomZones, RoomZone } from "./roomZones";
 
 interface AIClientConfig {
   provider: AIProvider;
@@ -93,6 +94,8 @@ export interface FloorPlanResult {
   };
   /** Pre-placed furniture items */
   placedFurniture?: PlacedFurniture[];
+  /** Color-coded functional zones (studios + one-bedroom open-plan living rooms) */
+  roomZones?: RoomZone[];
   /** Building perimeter polygon (world coords) */
   buildingPolygon?: Array<{ x: number; y: number }>;
   /** For apartments: building corridor access point and the main entrance it connects to */
@@ -191,6 +194,7 @@ export async function generateFloorPlan(
       kitchenLivingConnection: input.kitchenLivingConnection ?? "open",
     });
     const furniture = suggestFurniture(layout.rooms, layout.doors, layout.windows);
+    const roomZones = computeRoomZones(layout.rooms, layout.doors, layout.windows, furniture);
 
     // ── Post-furniture check: if an ensuite has no toilet, sink, or shower/bathtub,
     //     it's not functional — remove it and warn the user.
@@ -232,6 +236,7 @@ export async function generateFloorPlan(
       sustainabilityScore: parsed.sustainabilityScore || { light: 0.7, ventilation: 0.7, energy: 0.7, overall: 0.7 },
       costEstimate: parsed.costEstimate || { low: 50000, high: 80000, currency: "USD" },
       placedFurniture: furniture,
+      roomZones,
       buildingPolygon: layout.buildingPolygon,
       entranceApproach: layout.entranceApproach,
       raw,
@@ -244,6 +249,7 @@ export async function generateFloorPlan(
   const legacyDoors: Door[] = parsed.doors || [];
   const legacyWindows: Window[] = parsed.windows || [];
   const legacyFurniture = suggestFurniture(legacyRooms, legacyDoors, legacyWindows);
+  const legacyRoomZones = computeRoomZones(legacyRooms, legacyDoors, legacyWindows, legacyFurniture);
   // Validate against user description
   const legacyWarnings = validateRoomPlacement(
     input.description,
@@ -262,6 +268,7 @@ export async function generateFloorPlan(
     sustainabilityScore: parsed.sustainabilityScore || { light: 0.7, ventilation: 0.7, energy: 0.7, overall: 0.7 },
     costEstimate: parsed.costEstimate || { low: 50000, high: 80000, currency: "USD" },
     placedFurniture: legacyFurniture,
+    roomZones: legacyRoomZones,
     raw,
     warnings: legacyWarnings,
   };
@@ -341,7 +348,7 @@ function validateRoomPlacement(
 
   if (bedCountMatch) {
     const requested = parseInt(bedCountMatch[1]);
-    let placed = placedLower.filter(n => /bedroom|master|studio/i.test(n) && !/bathroom/i.test(n)).length;
+    const placed = placedLower.filter(n => /bedroom|master|studio/i.test(n) && !/bathroom/i.test(n)).length;
     if (placed < requested) {
       warnings.push(
         `You asked for ${requested} bedroom${requested > 1 ? "s" : ""} but only ${placed} could fit. ` +

@@ -355,13 +355,6 @@ describe("windows", () => {
     expect(studio, "Studio should exist").toBeDefined();
 
     if (bathroom && studio) {
-      // Check if bathroom is carved from studio (inside studio bounds)
-      const bInStudio =
-        bathroom.x >= studio.x - 0.01 &&
-        bathroom.y >= studio.y - 0.01 &&
-        bathroom.x + bathroom.width <= studio.x + studio.width + 0.01 &&
-        bathroom.y + bathroom.height <= studio.y + studio.height + 0.01;
-
       // Verify the bathroom exists and is inside the studio
       // The exact corner can vary but should not touch the bottom-left corner
       // since that touches both the entrance wall (left) and balcony wall (bottom)
